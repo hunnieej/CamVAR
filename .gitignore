@@ -1,0 +1,15 @@
+dataset/
+ckpt/
+.vscode
+.ruff_cache
+star-t2i/
+__pycache__/
+*.pyc
+*.pth
+*.ckpt
+*.bin
+*.pt
+outputs/
+log/
+wandb/
+.ipynb_checkpoints/

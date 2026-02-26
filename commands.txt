@@ -1,0 +1,49 @@
+1) Run a quick generator step:
+   PYTORCH_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=1 python train_faceray.py --data_root dataset/cubemap/train --num_steps 1
+2) Run a quick sampler step (with your Stage‑1 ckpt):
+   CUDA_VISIBLE_DEVICES=1 python train_sampler_faceray.py --gen_ckpt /path/to/stage1_generator.pth --num_steps 1
+
+[260226]
+What’s new
+- Two‑stage wrapper: train_faceray_two_stage.py
+  - Runs generator training then sampler training.
+  - Auto‑loads the latest generator checkpoint if --gen_ckpt is not provided.
+- Sampler auto‑load: train_sampler_faceray.py
+  - If --gen_ckpt is not set, it scans --gen_ckpt_dir (default ckpt/faceray_stage1) for the newest *.pth.
+Additional fix for your CUDA assert
+- models/face_ray_attention.py now clamps face/token indices and masks invalid entries before gathers.
+- This prevents out‑of‑bounds indices from crashing CUDA kernels.
+How to run the two‑stage wrapper
+CUDA_VISIBLE_DEVICES=1 \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+python train_faceray_two_stage.py \
+  --data_root dataset/cubemap/train \
+  --gen_steps 20000 \
+  --sampler_steps 20000 \
+  --amp
+How to run sampler standalone (auto‑load latest generator)
+CUDA_VISIBLE_DEVICES=1 \
+python train_sampler_faceray.py --num_steps 1 --amp
+Notes
+- Auto‑loading uses:
+  - --gen_ckpt_dir (default ckpt/faceray_stage1)
+  - --gen_ckpt_pattern (default *.pth)
+- If you want a specific checkpoint, pass --gen_ckpt /path/to.ckpt.
+If you still see a CUDA assert after this, run once with:
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1 python train_sampler_faceray.py --num_steps 1 --amp
+and paste the exact line it points to.
+
+
+Generator (FaceRayAdapter)
+- Command:
+CUDA_VISIBLE_DEVICES=1 python train_faceray.py --data_root dataset/cubemap/train --batch_size 1 --num_steps 30000 --lr 5e-5 --lambda_seam 0.1 --seam_warmup_ratio 0.05 --seam_tau 0.2 --amp --save_every 500 --save_best --save_best_name faceray_stage1_generator_best.pth
+
+  - Notes:
+  - 12k steps is ~5 epochs with batch_size=1 (2461 scenes).
+  - lr 5e-5 is safer than 1e-4 for small data.
+  - Keep lambda_seam=0.1 and seam_tau=0.2 for stable alignment.
+
+Sampler
+- Command:
+python train_sampler_faceray.py --use_best_gen_ckpt --amp
+CUDA_VISIBLE_DEVICES=1 python train_sampler_faceray.py --data_root dataset/cubemap/train --num_steps 12000 --lr 5e-5 --amp

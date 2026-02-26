@@ -1,0 +1,127 @@
+Implemented FaceRay-STAR cubemap extension (v1).
+
+New files:
+- models/cubemap_geometry.py: cubemap frames, ray building, projection, boundary/neighbor precompute, orthonormality + projection-consistency checks.
+- models/face_ray_attention.py: FaceRayAttentionAdapter with sparse boundary attention and zero-init out projection.
+- data/cubemap_scene_dataset.py: scene-based cubemap loader returning faces [6,3,512,512], prompt, scene_id.
+- models/basic_var_faceray.py: AttnBlock variant with FaceRay adapter parallel branch.
+- models/var_drop_faceray.py: FaceRay-enabled VAR + sampler, cubemap-aware sampler handling, build_vae_var_faceray.
+- train_faceray.py: generator fine-tuning with L_face + seam loss + seam warmup.
+- train_sampler_faceray.py: sampler training with L_mask; accepts --gen_ckpt.
+
+Notes:
+- Adapter inserted as parallel branch to self-attn and uses sparse inter-face attention on boundary tokens.
+- Masked sampler uses block-diagonal attention for per-face separation, with inter-face coupling from FaceRayAdapter.
+- Geometry sanity checks include orthonormality and projection-consistency statistics.
+
+[2026-02-25] TypeError: 'float' object is not subscriptable fixed
+  Changed files: models/cubemap_geometry.py
+  Notes: handle scalar u/v in build_ray and tighten typing for projection checks.
+[2026-02-25] IndexError: index 1 is out of bounds for dimension 1 fixed
+  Changed files: models/cubemap_geometry.py
+  Notes: token_centers now uses full meshgrid to return (h,w) u/v grids.
+[2026-02-25] RuntimeError: size mismatch in _build_stage_mask fixed
+  Changed files: models/var_drop_faceray.py
+  Notes: guard bg==0 when building stage mask slice.
+[2026-02-25] RuntimeError: size mismatch in _build_stage_mask fixed
+  Changed files: models/var_drop_faceray.py
+  Notes: simplify stage mask to zero mask (sampler now uses its own block-diagonal bias).
+[2026-02-25] RepositoryNotFoundError: 401 Unauthorized fixed
+  Changed files: models/text_encoder.py, train_faceray.py, train_sampler_faceray.py
+  Notes: enforce local-only loading for CLIP tokenizer/encoder to avoid HF hub access.
+[2026-02-25] OSError: couldn't connect to https://huggingface.co fixed
+  Changed files: train_faceray.py, train_sampler_faceray.py
+  Notes: set offline env vars and default text encoder path to ckpt/CLIP without modifying text_encoder.
+[2026-02-25] RuntimeError: Sizes of tensors must match except in dimension 1 fixed
+  Changed files: models/var_drop_faceray.py
+  Notes: added word_embed projection before concatenating teacher-forcing inputs.
+[2026-02-25] Warning: projection mapped same-face and adapter delta non-zero fixed
+  Changed files: models/cubemap_geometry.py, models/var_drop_faceray.py
+  Notes: projection check now nudges boundary rays outward; reset FaceRay out_proj to zero after init.
+[2026-02-25] RuntimeError: tensors on different devices (cuda vs cpu) fixed
+  Changed files: models/embed_rope_faceray.py, models/basic_var_faceray.py
+  Notes: use FaceRay-specific rotary helper that moves freqs_cis to x device.
+[2026-02-25] RuntimeError: size mismatch in attn_l2_norm fixed
+  Changed files: models/basic_var_faceray.py
+  Notes: align scale_mul with q layout for flash/xform path and normalize like base Attention.
+[2026-02-25] ValueError: Invalid shape for attention bias fixed
+  Changed files: models/basic_var_faceray.py
+  Notes: expand attention bias for xformers to (B, H, L, L).
+[2026-02-25] VRAM OOM mitigation added
+  Changed files: train_faceray.py
+  Notes: added AMP (autocast + GradScaler) flag to reduce memory usage.
+[2026-02-25] VRAM OOM mitigation added
+  Changed files: train_sampler_faceray.py
+  Notes: added AMP (autocast + GradScaler) flag to reduce memory usage.
+[2026-02-25] OOM mitigation: backbone checkpointing added
+  Changed files: models/basic_var_faceray.py, models/var_drop_faceray.py, train_faceray.py
+  Notes: checkpoint backbone blocks and set PYTORCH_ALLOC_CONF=expandable_segments:True.
+[2026-02-25] FutureWarning: autocast deprecation fixed
+  Changed files: train_faceray.py, train_sampler_faceray.py
+  Notes: switch to torch.amp.autocast_mode.autocast("cuda", ...).
+[2026-02-25] UserWarning: seam loss broadcasting fixed
+  Changed files: train_faceray.py
+  Notes: seam loss now uses 1-to-1 neighbor pairing instead of implicit broadcast.
+[2026-02-25] FutureWarning: autocast deprecation fixed
+  Changed files: train_faceray.py, train_sampler_faceray.py
+  Notes: import autocast from torch.amp.autocast_mode.
+[2026-02-25] Checkpoint saving added
+  Changed files: train_faceray.py
+  Notes: save FaceRay generator ckpt periodically and at end for sampler training.
+[2026-02-25] RuntimeError: freqs_cis dimension mismatch fixed
+  Changed files: models/var_drop_faceray.py
+  Notes: build sampler freqs_cis as 2D (L,C) before concat.
+[2026-02-25] FutureWarning: GradScaler deprecation fixed
+  Changed files: train_faceray.py, train_sampler_faceray.py
+  Notes: switch to torch.amp.GradScaler("cuda", ...).
+[2026-02-25] RuntimeError: embedding index on cpu fixed
+  Changed files: models/var_drop_faceray.py
+  Notes: move lvl_last indices to same device as feature tensor before embedding.
+[2026-02-25] NotImplementedError: xformers attention bias unsupported fixed
+  Changed files: models/basic_var_faceray.py
+  Notes: disable xformers path when attn_bias is provided.
+[2026-02-25] ValueError: Batch size must be divisible by face_group fixed
+  Changed files: models/face_ray_attention.py
+  Notes: handle sampler mode by applying adapter to tokens after text prefix.
+[2026-02-25] CUDA index out of bounds fixed
+  Changed files: models/cubemap_geometry.py
+  Notes: clamp projected (i,j) indices to valid range in uv_to_ij.
+[2026-02-25] CUDA index out of bounds fixed
+  Changed files: models/face_ray_attention.py
+  Notes: use local neighbor indices for sampler-mode tokens (no global offset).
+[2026-02-25] CUDA index out of bounds fixed
+  Changed files: models/face_ray_attention.py
+  Notes: clamp face/token indices and mask invalid entries before attention gather.
+[2026-02-25] Two-stage wrapper added
+  Changed files: train_faceray_two_stage.py, train_sampler_faceray.py
+  Notes: wrapper runs generator then sampler and auto-selects latest generator checkpoint.
+[2026-02-25] RuntimeError: Index put requires the source and destination dtypes match fixed
+  Changed files: models/face_ray_attention.py
+  Notes: cast adapter output to match destination dtype before scatter.
+[2026-02-26] Cross-attention tuple-safe indexing added
+  Changed files: models/basic_var_faceray.py
+  Notes: handle tensor/tuple outputs without slicing batch.
+[2026-02-26] Multi-scale FaceRay precompute enabled
+  Changed files: models/cubemap_geometry.py, models/var_drop_faceray.py, models/face_ray_attention.py
+  Notes: build all-scale boundary/neighbor buffers and D_ray lookup with stage ids.
+[2026-02-26] Seam loss softmin over neighbors added
+  Changed files: train_faceray.py
+  Notes: use full neighbor set with softmin and tau; print avg neighbors.
+[2026-02-26] Best-checkpoint support added
+  Changed files: train_faceray.py, train_sampler_faceray.py, train_faceray_two_stage.py
+  Notes: save best generator ckpt and allow sampler/wrapper to prefer it.
+[2026-02-26] Training progress bars added
+  Changed files: train_faceray.py, train_sampler_faceray.py
+  Notes: add tqdm step progress to show ongoing training.
+[2026-02-26] Gradient accumulation added
+  Changed files: train_faceray.py, train_sampler_faceray.py
+  Notes: add --accum_steps to accumulate gradients without extra VRAM.
+[2026-02-26] Gradient accumulation step logic fixed
+  Changed files: train_faceray.py, train_sampler_faceray.py
+  Notes: correct optimizer stepping and flush partial accumulation at end.
+[2026-02-26] Attention impl logging added
+  Changed files: models/basic_var_faceray.py, train_faceray.py, train_sampler_faceray.py
+  Notes: log flash/xform/sdpa usage on first step.
+[2026-02-26] W&B full logging added
+  Changed files: train_faceray.py, train_sampler_faceray.py
+  Notes: add W&B init, scalar/perf logging, image logging, and heavy metrics hooks.
