@@ -374,6 +374,210 @@ class VAR(nn.Module):
         )
         return logits_BLV_[:, 1:], mask
 
+    def autoregressive_infer_cfg(
+        self,
+        B: int,
+        label_B: Optional[Union[int, torch.LongTensor]],
+        encoder_hidden_states=None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        encoder_pool_feat=None,
+        g_seed: Optional[int] = None,
+        cfg=1.5,
+        top_k=0,
+        top_p=0.0,
+        more_smooth=False,
+        w_mask=False,
+        sample_version="new",
+    ) -> torch.Tensor:
+        encoder_attention_mask = prepare_attn_mask(
+            encoder_attention_mask=encoder_attention_mask
+        )
+
+        if g_seed is None:
+            rng = None
+        else:
+            self.rng.manual_seed(g_seed)
+            rng = self.rng
+
+        if not self.noise_sampling:
+            sos = self.encoder_proj(encoder_pool_feat)
+        else:
+            sos = torch.randn([2 * B, self.D], device=encoder_pool_feat.device)
+
+        if not self.rotary_pos_emb:
+            lvl_pos = self.pos_1LC
+        else:
+            lvl_pos = 0
+
+        if self.absolute_lvl_emb:
+            lvl_pos = lvl_pos + self.lvl_embed(self.lvl_1L)
+            cond_lvl_emb = None
+        if self.shared_aln:
+            cond_lvl_emb = self.lvl_embed_proj(
+                torch.cat(
+                    [
+                        self.lvl_embed(self.lvl_1L),
+                        self.lvl_embed(
+                            torch.full(
+                                self.lvl_1L.shape,
+                                self.lvl_1L[0, -1],
+                                device=self.lvl_1L.device,
+                            )
+                        ),
+                    ],
+                    dim=-1,
+                )
+            )
+            cond_lvl_emb = self.lvl_embed_adaln(cond_lvl_emb)
+
+        if (not self.rotary_pos_emb) or (self.absolute_lvl_emb):
+            next_token_map = (
+                sos.unsqueeze(1).expand(2 * B, self.first_l, -1)
+                + self.pos_start.expand(2 * B, self.first_l, -1)
+                + lvl_pos[:, : self.first_l]
+            )
+        else:
+            next_token_map = sos.unsqueeze(1).expand(
+                2 * B, self.first_l, -1
+            ) + self.pos_start.expand(2 * B, self.first_l, -1)
+
+        cur_L = 0
+        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+
+        for b in self.blocks:
+            b.attn.kv_caching(True)
+        for si, pn in enumerate(self.patch_nums):
+            ratio = si / self.num_stages_minus_1
+            t = cfg * ratio
+            cur_L += pn * pn
+            freqs_cis_cur = (
+                self.freqs_cis[cur_L - pn * pn : cur_L, :]
+                if self.freqs_cis is not None
+                else None
+            )
+            cond_lvl_emb_cur = (
+                cond_lvl_emb[:, cur_L - pn * pn : cur_L, ...]
+                if cond_lvl_emb is not None
+                else None
+            )
+            x = next_token_map
+            for i, b in enumerate(self.blocks):
+                x = b(
+                    x=x,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    cond_BD=cond_lvl_emb_cur,
+                    attn_bias=None,
+                    freqs_cis=freqs_cis_cur,
+                    layer_id=i,
+                    face_group=1,
+                )
+
+            if w_mask and si >= self.from_idx:
+                embed_Cvae = None
+                h_BChw = torch.zeros((B, pn * pn, self.Cvae), device=x.device)
+                mask = torch.zeros((B, pn * pn), device=x.device)
+
+                if sample_version == "1024":
+                    step_thresh = 5
+                    si_thresh = 13
+                    self.mask_scheduler.step = 15 if si > 12 else 8
+                else:
+                    step_thresh = 10000
+                    si_thresh = -1
+                    self.mask_scheduler.step = 8
+
+                self.mask_scheduler._create_scheduler(patch_size=pn)
+                for step in range(self.mask_scheduler.step):
+                    _, t_maskratio = self.mask_scheduler.get_mask(step, x[..., 0])
+                    if step < step_thresh and si < si_thresh:
+                        logits_BlV = self.get_logits(x)
+                        embed_Cvae, conf_Bl = self.from_logit2emb(
+                            logits_BlV, t=t, rng=rng, top_k=top_k, top_p=top_p, B=B
+                        )
+                        tresh_conf, indice_mask = torch.topk(
+                            conf_Bl.view(B, -1), k=t_maskratio, dim=-1
+                        )
+                        mask_0 = mask.clone().detach()
+                        for i_mask, ind_mask in enumerate(indice_mask):
+                            mask[i_mask, ind_mask] = 1
+                        h_BChw += embed_Cvae * (mask[..., None] - mask_0[..., None])
+                    else:
+                        text_pool_feat = (
+                            self.encoder_proj2(encoder_pool_feat.unsqueeze(1))
+                            + self.pos_start_last
+                        )
+                        cur_feature = torch.cat(
+                            [
+                                text_pool_feat,
+                                self.word_embed_head(h_BChw * mask[..., None]).repeat(
+                                    2, 1, 1
+                                )
+                                + self.lvl_embed_2(
+                                    self.lvl_1L[:, cur_L - pn * pn : cur_L]
+                                ),
+                            ],
+                            dim=1,
+                        )
+
+                        logits_BlV = self.sample(
+                            feature=cur_feature,
+                            prev_emb=torch.cat([text_pool_feat, x], dim=1),
+                            attn_bias=None,
+                            freqs_cis=torch.cat(
+                                [self.freqs_cis[0, None], freqs_cis_cur], dim=0
+                            ),
+                            face_group=1,
+                        )
+                        logits_BlV = logits_BlV[:, 1:]
+                        embed_Cvae, conf_Bl = self.from_logit2emb(
+                            logits_BlV, t=cfg, rng=rng, top_k=top_k, top_p=top_p, B=B
+                        )
+                    conf_Bl = torch.rand_like(conf_Bl) if step < 5 else conf_Bl
+                    conf_Bl = conf_Bl * (1 - mask[..., None])
+                    tresh_conf, indice_mask = torch.topk(
+                        conf_Bl.view(B, -1), k=t_maskratio, dim=-1
+                    )
+                    mask_0 = mask.clone().detach()
+                    for i_mask, ind_mask in enumerate(indice_mask):
+                        mask[i_mask, ind_mask] = 1
+                    h_BChw += embed_Cvae * (mask[..., None] - mask_0[..., None])
+            else:
+                logits_BlV = self.get_logits(x)
+                logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+                if not more_smooth:
+                    idx_Bl = sample_with_top_k_top_p_(
+                        logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1
+                    )
+                    h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)
+                else:
+                    gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                    h_BChw = torch.nn.functional.gumbel_softmax(
+                        logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1
+                    ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+            f_hat, next_token_map = self.vae_quant_proxy[
+                0
+            ].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+            if si != self.num_stages_minus_1:
+                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                if (not self.rotary_pos_emb) or (self.absolute_lvl_emb):
+                    next_token_map = (
+                        self.word_embed(next_token_map)
+                        + lvl_pos[:, cur_L : cur_L + self.patch_nums[si + 1] ** 2]
+                    )
+                else:
+                    next_token_map = self.word_embed(next_token_map)
+                next_token_map = next_token_map.repeat(2, 1, 1)
+
+        for b in self.blocks:
+            b.attn.kv_caching(False)
+        with torch.autocast(
+            "cuda", enabled=False, dtype=torch.float32, cache_enabled=True
+        ):
+            return self.vae_proxy[0].fhat_to_img(f_hat.float()).add_(1).mul_(0.5)
+
     def _build_sampler_attn(self, face_group: int, last_len: int) -> torch.Tensor:
         total = 1 + face_group * last_len
         mask = torch.full((total, total), float("-inf"), device=dist.get_device())

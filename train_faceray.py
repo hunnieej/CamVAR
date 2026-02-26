@@ -182,6 +182,19 @@ def make_dice_image(faces: torch.Tensor) -> Image.Image:
     return canvas
 
 
+def boundary_mae_pixels(faces: torch.Tensor, strip_w: int = 2) -> float:
+    faces = faces.detach().cpu().float()
+    f, r, b, l, u, d = faces
+    edges = [
+        (f[:, :, -strip_w:], r[:, :, :strip_w]),
+        (f[:, :, :strip_w], l[:, :, -strip_w:]),
+        (f[:, :strip_w, :], u[:, -strip_w:, :]),
+        (f[:, -strip_w:, :], d[:, :strip_w, :]),
+    ]
+    diffs = [(a - b).abs().mean().item() for a, b in edges]
+    return float(sum(diffs) / max(len(diffs), 1))
+
+
 def adapter_stats(adapter: torch.nn.Module) -> dict:
     params = [p for p in adapter.parameters() if p.requires_grad]
     param_norm = (
