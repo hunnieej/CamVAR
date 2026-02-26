@@ -125,3 +125,12 @@ Notes:
 [2026-02-26] W&B full logging added
   Changed files: train_faceray.py, train_sampler_faceray.py
   Notes: add W&B init, scalar/perf logging, image logging, and heavy metrics hooks.
+[2026-02-26] W&B Settings validation fixed
+  Changed files: train_faceray.py
+  Notes: use default wandb.Settings() for compatibility.
+[2026-02-26] W&B Settings validation fixed
+  Changed files: train_sampler_faceray.py
+  Notes: use default wandb.Settings() for compatibility.
+[2026-02-26] Boundary edge metric shape fix
+  Changed files: train_faceray.py
+  Notes: align q_faces with neighbor_faces when building edge masks.

@@ -109,7 +109,7 @@ def init_wandb(args, extra_config: dict):
         run_name = f"train_faceray-{time.strftime('%Y%m%d-%H%M%S')}"
     config = vars(args).copy()
     config.update(extra_config)
-    settings = wandb.Settings(_stats_open_metrics=True)
+    settings = wandb.Settings()
     return wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
@@ -250,7 +250,8 @@ def boundary_mae_by_edge(feat_last: torch.Tensor, precompute) -> dict:
     ]
     out = {}
     for name, src, tgt in edges:
-        edge_mask = (q_faces == src) & (neighbor_faces == tgt)
+        q_mask = q_faces.unsqueeze(1) == src
+        edge_mask = q_mask & (neighbor_faces == tgt)
         if not edge_mask.any():
             continue
         edge_diff = diff[:, edge_mask, :]

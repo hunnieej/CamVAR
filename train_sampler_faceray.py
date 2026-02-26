@@ -50,7 +50,7 @@ def init_wandb(args, extra_config: dict):
         run_name = f"train_sampler-{time.strftime('%Y%m%d-%H%M%S')}"
     config = vars(args).copy()
     config.update(extra_config)
-    settings = wandb.Settings(_stats_open_metrics=True)
+    settings = wandb.Settings()
     return wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
