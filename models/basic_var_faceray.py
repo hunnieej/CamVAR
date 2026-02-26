@@ -282,6 +282,7 @@ class AttnBlock(nn.Module):
         freqs_cis=None,
         layer_id=0,
         face_group=1,
+        log_adapter_delta: bool = False,
     ):
         if freqs_cis is not None:
             freqs_cis = freqs_cis.to(x.device)
@@ -315,7 +316,13 @@ class AttnBlock(nn.Module):
         x = x + self.drop_path(sa_out)
 
         if self.faceray_adapter is not None:
-            x = x + self.faceray_adapter(x_in, face_group=face_group)
+            delta = self.faceray_adapter(x_in, face_group=face_group)
+            if log_adapter_delta:
+                delta_mean_abs = delta.detach().abs().mean().item()
+                print(
+                    f"[FaceRay] block={layer_id} face_group={face_group} delta_mean_abs={delta_mean_abs:.6f}"
+                )
+            x = x + delta
 
         def _cross_ffn_forward(x_input):
             x_out = x_input

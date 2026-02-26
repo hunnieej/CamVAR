@@ -66,19 +66,15 @@ def load_fixed_prompts(args, dataset):
             Path(args.wandb_fixed_prompt_file).read_text(encoding="utf-8").splitlines()
         )
         prompts = [line.strip() for line in lines if line.strip()]
-    else:
-        prompts = [
-            "A cozy mountain cabin at sunset",
-            "A futuristic city skyline at night",
-            "A calm tropical beach with palm trees",
-            "A snowy forest with soft light",
-            "A vibrant street market",
-            "A serene lake with reflections",
-            "A desert canyon at golden hour",
-            "A modern living room interior",
-        ]
-    prompts = prompts[: args.wandb_num_fixed_prompts]
-    fixed_indices = list(range(min(len(dataset), len(prompts))))
+        prompts = prompts[: args.wandb_num_fixed_prompts]
+        fixed_indices = list(range(min(len(dataset), len(prompts))))
+        return prompts, fixed_indices
+
+    fixed_indices = list(range(min(len(dataset), args.wandb_num_fixed_prompts)))
+    prompts = []
+    for idx in fixed_indices:
+        item = dataset[idx]
+        prompts.append(item.get("prompt", ""))
     return prompts, fixed_indices
 
 

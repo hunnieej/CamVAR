@@ -305,6 +305,7 @@ class VAR(nn.Module):
                 freqs_cis=freqs_cis,
                 layer_id=i,
                 face_group=face_group,
+                log_adapter_delta=False,
             )
 
         logits_BLV = self.get_logits(x_BLC.float())
@@ -374,6 +375,66 @@ class VAR(nn.Module):
         )
         return logits_BLV_[:, 1:], mask
 
+    def autoregressive_infer_cubemap(
+        self,
+        encoder_hidden_states,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        encoder_pool_feat=None,
+        g_seed: Optional[int] = None,
+        cfg=1.5,
+        top_k=0,
+        top_p=0.0,
+        more_smooth=False,
+        w_mask=False,
+        sample_version="new",
+        face_group: int = 6,
+        face_order=(0, 1, 2, 3, 4, 5),
+        log_face_group: bool = True,
+        log_adapter_delta: bool = True,
+    ) -> torch.Tensor:
+        """Cubemap-joint inference entrypoint.
+
+        Expects per-scene text embeddings and generates 6 faces jointly.
+        Output order is enforced to [F, R, B, L, U, D] by default.
+        """
+
+        if face_group != 6:
+            raise ValueError("autoregressive_infer_cubemap expects face_group=6")
+
+        B_scene = encoder_hidden_states.shape[0]
+        encoder_hidden_states = encoder_hidden_states.repeat_interleave(
+            face_group, dim=0
+        )
+        if encoder_attention_mask is not None:
+            encoder_attention_mask = encoder_attention_mask.repeat_interleave(
+                face_group, dim=0
+            )
+        if encoder_pool_feat is not None:
+            encoder_pool_feat = encoder_pool_feat.repeat_interleave(face_group, dim=0)
+
+        imgs = self.autoregressive_infer_cfg(
+            B=B_scene * face_group,
+            label_B=None,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            encoder_pool_feat=encoder_pool_feat,
+            g_seed=g_seed,
+            cfg=cfg,
+            top_k=top_k,
+            top_p=top_p,
+            more_smooth=more_smooth,
+            w_mask=w_mask,
+            sample_version=sample_version,
+            face_group=face_group,
+            log_face_group=log_face_group,
+            log_adapter_delta=log_adapter_delta,
+        )
+
+        b, c, h, w = imgs.shape
+        imgs = imgs.view(B_scene, face_group, c, h, w)
+        imgs = imgs[:, list(face_order), ...]
+        return imgs.reshape(B_scene * face_group, c, h, w)
+
     def autoregressive_infer_cfg(
         self,
         B: int,
@@ -388,6 +449,9 @@ class VAR(nn.Module):
         more_smooth=False,
         w_mask=False,
         sample_version="new",
+        face_group: int = 1,
+        log_face_group: bool = False,
+        log_adapter_delta: bool = False,
     ) -> torch.Tensor:
         encoder_attention_mask = prepare_attn_mask(
             encoder_attention_mask=encoder_attention_mask
@@ -396,8 +460,8 @@ class VAR(nn.Module):
         if g_seed is None:
             rng = None
         else:
-            self.rng.manual_seed(g_seed)
-            rng = self.rng
+            rng = torch.Generator(device=encoder_pool_feat.device)
+            rng.manual_seed(g_seed)
 
         if not self.noise_sampling:
             sos = self.encoder_proj(encoder_pool_feat)
@@ -410,7 +474,7 @@ class VAR(nn.Module):
             lvl_pos = 0
 
         if self.absolute_lvl_emb:
-            lvl_pos = lvl_pos + self.lvl_embed(self.lvl_1L)
+            lvl_pos = lvl_pos + self.lvl_embed(self.lvl_1L.to(sos.device))
             cond_lvl_emb = None
         if self.shared_aln:
             cond_lvl_emb = self.lvl_embed_proj(
@@ -444,6 +508,10 @@ class VAR(nn.Module):
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
+        if log_face_group:
+            for bi, _ in enumerate(self.blocks):
+                print(f"[FaceRay] block={bi} face_group={face_group}")
+
         for b in self.blocks:
             b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):
@@ -470,7 +538,8 @@ class VAR(nn.Module):
                     attn_bias=None,
                     freqs_cis=freqs_cis_cur,
                     layer_id=i,
-                    face_group=1,
+                    face_group=face_group,
+                    log_adapter_delta=log_adapter_delta and si == 0,
                 )
 
             if w_mask and si >= self.from_idx:
@@ -527,7 +596,7 @@ class VAR(nn.Module):
                             freqs_cis=torch.cat(
                                 [self.freqs_cis[0, None], freqs_cis_cur], dim=0
                             ),
-                            face_group=1,
+                            face_group=face_group,
                         )
                         logits_BlV = logits_BlV[:, 1:]
                         embed_Cvae, conf_Bl = self.from_logit2emb(

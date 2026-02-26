@@ -118,26 +118,21 @@ def init_wandb(args, extra_config: dict):
         settings=settings,
     )
 
-
 def load_fixed_prompts(args, dataset):
     if args.wandb_fixed_prompt_file:
         lines = (
             Path(args.wandb_fixed_prompt_file).read_text(encoding="utf-8").splitlines()
         )
         prompts = [line.strip() for line in lines if line.strip()]
-    else:
-        prompts = [
-            "A cozy mountain cabin at sunset",
-            "A futuristic city skyline at night",
-            "A calm tropical beach with palm trees",
-            "A snowy forest with soft light",
-            "A vibrant street market",
-            "A serene lake with reflections",
-            "A desert canyon at golden hour",
-            "A modern living room interior",
-        ]
-    prompts = prompts[: args.wandb_num_fixed_prompts]
-    fixed_indices = list(range(min(len(dataset), len(prompts))))
+        prompts = prompts[: args.wandb_num_fixed_prompts]
+        fixed_indices = list(range(min(len(dataset), len(prompts))))
+        return prompts, fixed_indices
+
+    fixed_indices = list(range(min(len(dataset), args.wandb_num_fixed_prompts)))
+    prompts = []
+    for idx in fixed_indices:
+        item = dataset[idx]
+        prompts.append(item.get("prompt", ""))
     return prompts, fixed_indices
 
 
@@ -266,10 +261,17 @@ def main() -> None:
     parser.add_argument("--data_root", type=str, default="dataset/cubemap/train")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_steps", type=int, default=1000)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--lambda_seam", type=float, default=0.1)
     parser.add_argument("--seam_warmup_ratio", type=float, default=0.10)
     parser.add_argument("--seam_tau", type=float, default=0.2)
+    parser.add_argument("--demo_last_scale_only", action="store_true", default=False)
+    parser.add_argument("--demo_boundary_only", action="store_true", default=False)
+    parser.add_argument("--demo_subset_list", type=str, default="")
+    parser.add_argument("--demo_max_steps", type=int, default=5000)
+    parser.add_argument("--demo_seam_warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--demo_face_loss_weight", type=float, default=1.0)
+    parser.add_argument("--demo_seam_loss_weight", type=float, default=0.1)
     parser.add_argument("--vae_ckpt", type=str, default="ckpt/vae_ch160v4096z32.pth")
     parser.add_argument(
         "--var_ckpt",
@@ -286,9 +288,9 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--text_encoder_ckpt", type=str, default="ckpt/CLIP")
     parser.add_argument("--amp", action="store_true")
-    parser.add_argument("--accum_steps", type=int, default=1)
+    parser.add_argument("--accum_steps", type=int, default=4)
     parser.add_argument("--save_dir", type=str, default="ckpt/faceray_stage1")
-    parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument(
         "--save_name",
         type=str,
@@ -309,8 +311,8 @@ def main() -> None:
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_log_every", type=int, default=10)
-    parser.add_argument("--wandb_image_every", type=int, default=1000)
-    parser.add_argument("--wandb_metric_every", type=int, default=500)
+    parser.add_argument("--wandb_image_every", type=int, default=100)
+    parser.add_argument("--wandb_metric_every", type=int, default=100)
     parser.add_argument("--wandb_num_fixed_prompts", type=int, default=8)
     parser.add_argument("--wandb_fixed_prompt_file", type=str, default=None)
     args = parser.parse_args()
@@ -321,6 +323,18 @@ def main() -> None:
         args.wandb = False
 
     dataset = CubemapSceneDataset(args.data_root)
+    if args.demo_subset_list:
+        subset_ids = [
+            line.strip()
+            for line in Path(args.demo_subset_list)
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        subset_set = set(subset_ids)
+        dataset.scene_dirs = [p for p in dataset.scene_dirs if p.name in subset_set]
+        if not dataset.scene_dirs:
+            raise ValueError("demo_subset_list yielded empty dataset")
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=2
     )
@@ -379,14 +393,23 @@ def main() -> None:
     fixed_prompts, fixed_indices = load_fixed_prompts(args, dataset)
     fixed_faces = [dataset[idx]["faces"] for idx in fixed_indices]
 
-    warmup_steps = max(1, int(args.num_steps * args.seam_warmup_ratio))
+    is_demo = args.demo_last_scale_only or args.demo_boundary_only
+    num_steps = args.num_steps
+    seam_warmup_ratio = args.seam_warmup_ratio
+    if is_demo:
+        num_steps = min(num_steps, args.demo_max_steps)
+        seam_warmup_ratio = args.demo_seam_warmup_ratio
+        args.wandb_metric_every = max(args.wandb_metric_every, 2000)
+        args.wandb_image_every = max(args.wandb_image_every, 2000)
+
+    warmup_steps = max(1, int(num_steps * seam_warmup_ratio))
     step = 0
     best_loss = float("inf")
     loss_value = None
     loader_iter = iter(loader)
-    progress = tqdm(total=args.num_steps, desc="train_faceray", unit="step")
+    progress = tqdm(total=num_steps, desc="train_faceray", unit="step")
     optimizer.zero_grad(set_to_none=True)
-    while step < args.num_steps:
+    while step < num_steps:
         micro_start = time.perf_counter()
         try:
             batch = next(loader_iter)
@@ -422,8 +445,28 @@ def main() -> None:
                 face_group=6,
             )
 
+            bg_last, ed_last = var_model.begin_ends[-1]
+            logits_last = logits_BLV[:, bg_last:ed_last, :]
+            target_last = gt_BL[:, bg_last:ed_last]
+
+            if args.demo_last_scale_only:
+                if args.demo_boundary_only:
+                    boundary_local = (
+                        var_model.faceray_precompute.boundary_local_indices_last.to(
+                            logits_last.device
+                        )
+                    )
+                    logits_use = logits_last[:, boundary_local, :]
+                    target_use = target_last[:, boundary_local]
+                else:
+                    logits_use = logits_last
+                    target_use = target_last
+            else:
+                logits_use = logits_BLV
+                target_use = gt_BL
+
             loss_face = F.cross_entropy(
-                logits_BLV.view(-1, var_model.V), gt_BL.view(-1)
+                logits_use.reshape(-1, var_model.V), target_use.reshape(-1)
             )
 
             bg, ed = var_model.begin_ends[-1]
@@ -433,7 +476,13 @@ def main() -> None:
             )
 
             seam_weight = args.lambda_seam * min(1.0, step / warmup_steps)
-            loss = loss_face + seam_weight * seam_loss
+            if args.demo_last_scale_only:
+                loss = (
+                    args.demo_face_loss_weight * loss_face
+                    + seam_weight * args.demo_seam_loss_weight * seam_loss
+                )
+            else:
+                loss = loss_face + seam_weight * seam_loss
 
         if step == 0:
             block_attn = var_model.blocks[0].attn

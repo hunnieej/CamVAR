@@ -134,3 +134,24 @@ Notes:
 [2026-02-26] Boundary edge metric shape fix
   Changed files: train_faceray.py
   Notes: align q_faces with neighbor_faces when building edge masks.
+[2026-02-26] Demo training flags added
+  Changed files: train_faceray.py
+  Notes: demo last-scale/boundary-only loss and subset support.
+[2026-02-26] Cubemap demo generator script added
+  Changed files: demo_generate_cubemap.py
+  Notes: generate six faces + grid/dice from latest FaceRay checkpoint.
+[2026-02-26] Demo prompt-file support added
+  Changed files: demo_generate_cubemap.py
+  Notes: allow multiple prompts, save per-prompt subfolders and logs.
+[2026-02-26] Cubemap-coupled inference added
+  Changed files: models/var_drop_faceray.py, demo_generate_cubemap.py
+  Notes: new cubemap autoregressive inference and adapter delta check.
+[2026-02-26] Demo generation seed fix
+  Changed files: models/var_drop_faceray.py
+  Notes: use torch.Generator for autoregressive sampling instead of missing self.rng.
+[2026-02-26] Demo generation device fix
+  Changed files: models/var_drop_faceray.py
+  Notes: move lvl_1L indices to sos device before embedding.
+[2026-02-26] W&B fixed prompts aligned to dataset
+  Changed files: train_faceray.py, train_sampler_faceray.py
+  Notes: use dataset prompts for fixed samples when no prompt file provided.
