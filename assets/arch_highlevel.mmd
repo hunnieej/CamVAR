@@ -1,0 +1,18 @@
+flowchart TD
+  Text["Text prompt → CLIP/T5\n1024-d features"] -->|encoder_proj (1920×1024)| CrossCond[Cross-attn keys/values]
+
+  ImgTok["Image latents (32×32 grid)\nfrom VQ-VAE encoder"] --> Quant["VQ codebook lookup\n4096 entries, dim 32"]
+  Quant --> WordEmb["word_embed: 32 → 1920"]
+  WordEmb --> Pos["Add lvl_embed (10×1920) + rotary pos\nseq len 2240 (10-level pyramid)"]
+
+  Pos --> Stack["30× AttnBlock (causal)"]
+  CrossCond --> Stack
+
+  Stack --> Head["LayerNorm (no affine)\nhead_logits: 1920 → 4096"]
+  Head --> Sample["Sample next token id\n(CFG, top-k/p)"]
+  Sample -->|append token| Stack
+  Sample --> VQEmb["Code embedding 4096 → 32"]
+  VQEmb --> Recon["VQ-VAE decoder (ch=160)\npatch size 16 → 512×512 RGB"]
+
+  Encoder["VQ-VAE encoder\n(ch=160)"] --> ImgTok
+  Recon --> Output["Final image"]

@@ -13,3 +13,13 @@ outputs/
 log/
 wandb/
 .ipynb_checkpoints/
+Matterport3D_polished_jpg/
+polyhaven_jpg/
+build_mds/
+batch_search.sh
+check_status.sh
+polyhaven.jsonl
+test_erp_integration.py
+test_ray_adaptation.py
+train_single_gpu.sh
+db_sample_view/

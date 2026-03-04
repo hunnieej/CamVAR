@@ -1,9 +1,0 @@
-- Stage‑1 FaceRay adapters (joint cubemap training):
-CUDA_VISIBLE_DEVICES=1 python train_faceray.py --data_root dataset/cubemap/train --vae_ckpt ckpt/vae_ch160v4096z32.pth --var_ckpt ckpt/star_rope_d30_512-ar-ckpt-ep1-iter30000.pth --save_dir ckpt/faceray_stage1 --device cuda --batch_size 1 --lr 1e-4 --num_steps 1000
-
-- Stage‑2 FaceRay sampler (uses Stage‑1 generator checkpoint):
-python train_sampler_faceray.py \
-  --data_root dataset/cubemap/train \
-  --vae_ckpt ckpt/vae_ch160v4096z32.pth \
-  --gen_ckpt ckpt/faceray_stage1/faceray_stage1_generator.pth \
-  --device cuda --batch_size 1 --lr 1e-4 --num_steps 1000

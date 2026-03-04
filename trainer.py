@@ -20,11 +20,47 @@ from utils.misc import MetricLogger, TensorboardLogger
 from math import ceil
 from utils.utils import format_sentence
 from utils.mask_utils import Scheduler
+from dataset.extract_tangents import lonlat_to_dir, loxodrome_points, make_t_samples
+import math
 
 Ten = torch.Tensor
 FTen = torch.Tensor
 ITen = torch.LongTensor
 BTen = torch.BoolTensor
+
+
+def generate_validation_camera_dirs(
+    views_per_pano=12,
+    lat0_deg=-60,
+    lat1_deg=60,
+    lon0_deg=0,
+    bearing_deg=45,
+    spacing="rhumb",
+):
+    """Generate camera directions using the same loxodrome trajectory as training.
+
+    Args:
+        views_per_pano: Number of views (default: 12)
+        lat0_deg: Start latitude in degrees (default: -60)
+        lat1_deg: End latitude in degrees (default: 60)
+        lon0_deg: Start longitude in degrees (default: 0)
+        bearing_deg: Bearing angle in degrees (default: 45)
+        spacing: "rhumb" or "cosine" (default: "rhumb")
+
+    Returns:
+        List of (lon, lat) tuples in radians
+    """
+    lat0 = math.radians(lat0_deg)
+    lat1 = math.radians(lat1_deg)
+    lon0 = math.radians(lon0_deg)
+    bearing_rad = math.radians(bearing_deg)
+
+    t_samples = make_t_samples(views_per_pano, spacing=spacing)
+    lons, lats = loxodrome_points(
+        views_per_pano, lat0, lat1, lon0, bearing_rad, t_samples=t_samples
+    )
+
+    return list(zip(lons, lats))
 
 
 class VARTrainer(object):
@@ -75,15 +111,7 @@ class VARTrainer(object):
 
     @torch.no_grad()
     def inference_pic(
-        self,
-        args,
-        text_enc,
-        cur_ep,
-        cur_iter,
-        top_k=600,
-        top_p=0.8,
-        w_mask=False,
-        cubemap_joint: bool = False,
+        self, args, text_enc, cur_ep, cur_iter, top_k=600, top_p=0.8, w_mask=False
     ):
         seed = 4  # @param {type:"number"}
         # seed
@@ -94,6 +122,40 @@ class VARTrainer(object):
         self.var_wo_ddp.eval()
         self.vae_local.eval()
         text_enc.eval()
+
+        # Create save directory once
+        save_path = osp.join(
+            args.local_out_dir_path, "val_imgs", "ep%d_iter%d" % (cur_ep, cur_iter)
+        )
+        try:
+            if not osp.exists(save_path):
+                os.makedirs(save_path)
+        except:
+            print("failed to makedir %s" % save_path)
+
+        # Get camera parameters from args
+        fov_deg = getattr(args, "fov_deg", 120.0)
+        patch_size = getattr(args, "patch_size", 16)
+        views_per_pano = getattr(args, "erp_views_per_pano", 12)
+
+        # Get loxodrome parameters from args (same as training)
+        loxodrome_params = getattr(args, "erp_loxodrome_params", {})
+        lat0_deg = loxodrome_params.get("lat0", -60)
+        lat1_deg = loxodrome_params.get("lat1", 60)
+        lon0_deg = loxodrome_params.get("lon0", 0)
+        bearing_deg = loxodrome_params.get("bearing", 45)
+        spacing = loxodrome_params.get("spacing", "rhumb")
+
+        # Generate camera directions using same trajectory as training
+        camera_trajectory = generate_validation_camera_dirs(
+            views_per_pano=views_per_pano,
+            lat0_deg=lat0_deg,
+            lat1_deg=lat1_deg,
+            lon0_deg=lon0_deg,
+            bearing_deg=bearing_deg,
+            spacing=spacing,
+        )
+
         for i in range(ceil(len(args.instance_prompt) / args.infer_bsz)):
             prompt_cur = args.instance_prompt[
                 i * args.infer_bsz : min(
@@ -101,28 +163,25 @@ class VARTrainer(object):
                 )
             ]
             B_ = len(prompt_cur)
-            prompt_cur = prompt_cur + [""] * B_
+            prompt_cur_with_uncond = prompt_cur + [""] * B_
             label = torch.tensor([args.default_label] * B_).to(
                 args.device, non_blocking=True
             )
+
+            # Extract text embeddings once per prompt batch (before camera loop)
             with torch.inference_mode():
                 prompt_embeds, prompt_attention_mask, pooled_embed = (
-                    text_enc.extract_text_features(prompt_cur)
+                    text_enc.extract_text_features(prompt_cur_with_uncond)
                 )
-                if cubemap_joint:
-                    recon_B3HW = self.var_wo_ddp.autoregressive_infer_cubemap(
-                        encoder_hidden_states=prompt_embeds,
-                        encoder_attention_mask=prompt_attention_mask,
-                        encoder_pool_feat=pooled_embed,
-                        cfg=args.cfg,
-                        top_k=top_k,
-                        top_p=top_p,
-                        g_seed=seed,
-                        w_mask=w_mask,
-                        log_face_group=True,
-                        log_adapter_delta=True,
-                    )
-                else:
+
+            # Loop over camera trajectory views for multi-view validation
+            for view_idx, (lon, lat) in enumerate(camera_trajectory):
+                # Convert (lon, lat) to 3D direction vector
+                dir_np = lonlat_to_dir(np.array([lon]), np.array([lat]))  # (1, 3)
+                cam_dir = torch.from_numpy(dir_np).float().to(args.device)
+                cam_dir = cam_dir.expand(B_, 3)  # (B_, 3)
+
+                with torch.inference_mode():
                     recon_B3HW = self.var_wo_ddp.autoregressive_infer_cfg(
                         B=B_,
                         label_B=label,
@@ -134,47 +193,25 @@ class VARTrainer(object):
                         top_p=top_p,
                         g_seed=seed,
                         w_mask=w_mask,
-                        log_face_group=True,
-                        log_adapter_delta=True,
+                        # Camera parameters for ray adaptation
+                        cam_dir=cam_dir,
+                        fov_deg=fov_deg,
+                        patch_size=patch_size,
                     )
-            save_path = osp.join(
-                args.local_out_dir_path, "val_imgs", "ep%d_iter%d" % (cur_ep, cur_iter)
-            )
-            try:
-                if not osp.exists(save_path):
-                    os.makedirs(save_path)
-            except:
-                print("failed to makedir %s" % save_path)
-            if osp.exists(save_path):
-                if cubemap_joint:
-                    face_tags = ["F", "R", "B", "L", "U", "D"]
-                    recon = recon_B3HW.view(B_, 6, *recon_B3HW.shape[1:])
-                    for scene_idx, label in enumerate(prompt_cur[:B_]):
-                        for face_idx, tag in enumerate(face_tags):
-                            chw = (
-                                (
-                                    recon[scene_idx, face_idx].permute(1, 2, 0).cpu()
-                                    * 255.0
-                                )
-                                .numpy()
-                                .astype(np.uint8)
-                            )
-                            PImage.fromarray(chw).save(
-                                osp.join(
-                                    save_path,
-                                    "%s_%s.png" % (format_sentence(label), tag),
-                                )
-                            )
-                else:
-                    for i, label in enumerate(prompt_cur[:B_]):
+
+                # Save images with view index suffix
+                if osp.exists(save_path):
+                    for j, label_text in enumerate(prompt_cur):
                         chw = (
-                            (recon_B3HW[i].permute(1, 2, 0).cpu() * 255.0)
+                            (recon_B3HW[j].permute(1, 2, 0).cpu() * 255.0)
                             .numpy()
                             .astype(np.uint8)
                         )  # (hwc)
-                        PImage.fromarray(chw).save(
-                            osp.join(save_path, "%s.png" % (format_sentence(label)))
+                        filename = "%s_view%02d.png" % (
+                            format_sentence(label_text),
+                            view_idx,
                         )
+                        PImage.fromarray(chw).save(osp.join(save_path, filename))
 
         self.var_wo_ddp.train()
 
@@ -275,6 +312,8 @@ class VARTrainer(object):
         prompt_embeds: None,
         prog_si: int,
         prog_wp_it: float,
+        cam_dir: Optional[Ten] = None,
+        fov_deg: float = 100.0,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         # label_B是imagenet的class，inp_B3HW是输入图像
         # progressive training
@@ -314,6 +353,8 @@ class VARTrainer(object):
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=attn_mask,
                 encoder_pool_feat=pooled_embed,
+                cam_dir=cam_dir,
+                fov_deg=fov_deg,
             )
             if not drop_idxs == None:
                 gt_BL = gt_BL[:, drop_idxs]

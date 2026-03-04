@@ -35,7 +35,7 @@ vae_ckpt='/path/to/vae'
 texenc_ckpt='/path/to/SDXL_CLIP'
 
 patch_nums = [1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64]
-var_ckpt='./ckpt/star_rope_d30_512-ar-ckpt-ep1-iter30000.pth'
+var_ckpt='./ckpts/var_rope_d30_1024_sampler_mask_0108-ar-ckpt-ep2-iter6000.pth'
 
 # patch_nums = [1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64]
 # var_ckpt='./ckpts/var_rope_d30_1024_sampler_mask-ar-ckpt-ep1-iter26000.pth'

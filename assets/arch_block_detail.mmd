@@ -1,0 +1,11 @@
+flowchart LR
+  subgraph Block[AttnBlock b[i]]
+    LN1[ln_wo_grad (affine=False)] --> SA[Self-Attn blocks.i.attn\nqkv: 1920→(q,k,v), heads=30]
+    SA --> Add1[Residual + DropPath]
+    Add1 --> CA_LN[Optional ln_wo_grad]
+    CA_LN --> CA[Cross-Attn blocks.i.cross_attn\nkeys/values from text]
+    CA --> Add2[Residual]
+    Add2 --> LN2[ln_wo_grad (affine=False)]
+    LN2 --> FFN[FFN blocks.i.ffn\nfc1 1920→7680, GELU, fc2 7680→1920]
+    FFN --> Add3[Residual + DropPath]
+  end
