@@ -1,9 +1,11 @@
 {
-  "_comment": "Phase C: Ultra-fast validation (500 panos, 12 views, FOV=120°, ~6 hours)",
+  "_comment": "Phase C: 2-GPU DDP training (doubled throughput, same per-GPU batch size)",
+  "_batch_calc": "bs=8, ac=2, num_gpus=2 → per_gpu_batch = 8/2/2 = 2 samples/GPU/step",
+  "_effective_throughput": "2 samples/GPU × 2 GPUs × 2 accumulation = 8 effective batch size",
   
-  "exp_name": "phase_c_ray_adaptation",
+  "exp_name": "phase_c_ray_adaptation_2gpu",
   "wandb_project": "STAR-T2I-RayAdaptation",
-  "wandb_run_name": "phase_c_bs4",
+  "wandb_run_name": "phase_c_2gpu_bs8",
   "wandb_mode": "online",
   "dataset_type": "erp",
   "erp_jsonl_paths": ["dataset/ERP/matterport.jsonl", "dataset/ERP/polyhaven.jsonl"],
@@ -21,7 +23,7 @@
   },
   
   "depth": 30,
-  "bs": 4,
+  "bs": 8,
   "batch_size": 0,
   "glb_batch_size": 0,
   "ac": 2,
@@ -43,7 +45,7 @@
   "pretrained_ckpt": "ckpt/star_rope_d30_512-ar-ckpt-ep1-iter30000.pth",
   "text_enc": "clip",
   "text_enc_path": "ckpt/CLIP",
-  "local_out_dir_path": "outputs/260305_at3",
+  "local_out_dir_path": "outputs/260305_2gpu_bs8",
   "instance_prompt": "dataset/prompts/val_scenes_10.txt",
   
   "pn": "1_2_3_4_6_9_13_18_24_32",

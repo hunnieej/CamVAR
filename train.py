@@ -36,6 +36,7 @@ from utils.lr_control import filter_params
 
 import dist
 from utils import arg_util, misc
+from utils.wandb_logger import init_wandb_logger
 from dataset.data import (
     build_dataset,
     build_dataset_webtar,
@@ -56,23 +57,133 @@ def custom_collate_fn(batch):
     return torch.utils.data.dataloader.default_collate(batch)
 
 
+def save_training_batch_images(inp_B3HW, obj, ep, it, g_it, save_dir):
+    """Save a batch of training input images with camera direction annotations.
+
+    Args:
+        inp_B3HW: Input image tensor (B, 3, H, W) in [-1, 1] range.
+        obj: Data batch dict containing 'cam_dir', 'prompt', 'fov_deg', etc.
+        ep: Current epoch.
+        it: Current iteration within epoch.
+        g_it: Global iteration.
+        save_dir: Root output directory.
+    """
+    import PIL.Image as PImage, PIL.ImageDraw as PImageDraw
+    import PIL.ImageFont as PImageFont
+
+    batch_dir = os.path.join(save_dir, "train_batch_vis")
+    os.makedirs(batch_dir, exist_ok=True)
+
+    # Denormalize from [-1, 1] to [0, 255]
+    imgs = inp_B3HW.detach().cpu().float()
+    imgs = (imgs + 1.0) * 0.5  # [-1,1] -> [0,1]
+    imgs = imgs.clamp(0, 1)
+
+    B = imgs.shape[0]
+    H, W = imgs.shape[2], imgs.shape[3]
+
+    # Extract camera info
+    cam_dir_batch = obj.get("cam_dir", None)
+    prompts = obj.get("prompt", [""] * B)
+    fov_deg = obj.get("fov_deg", None)
+
+    # Parse (lon, lat) from collated cam_dir
+    lon_lat_list = []
+    if (
+        cam_dir_batch is not None
+        and isinstance(cam_dir_batch, (list, tuple))
+        and len(cam_dir_batch) == 2
+    ):
+        lon_tensor, lat_tensor = cam_dir_batch
+        if isinstance(lon_tensor, torch.Tensor):
+            for i in range(lon_tensor.shape[0]):
+                lon_deg = math.degrees(lon_tensor[i].item())
+                lat_deg = math.degrees(lat_tensor[i].item())
+                lon_lat_list.append((lon_deg, lat_deg))
+
+    # Build annotated images
+    annotated_imgs = []
+    for i in range(B):
+        img_np = (imgs[i].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        pil_img = PImage.fromarray(img_np)
+        draw = PImageDraw.Draw(pil_img)
+
+        # Build annotation text
+        lines = []
+        if i < len(lon_lat_list):
+            lon_d, lat_d = lon_lat_list[i]
+            lines.append(f"lon={lon_d:.1f} lat={lat_d:.1f}")
+        if fov_deg is not None:
+            fov_val = (
+                fov_deg[i].item() if isinstance(fov_deg, torch.Tensor) else fov_deg
+            )
+            lines.append(f"fov={fov_val:.0f}")
+        if i < len(prompts):
+            prompt_short = prompts[i][:60] + ("..." if len(prompts[i]) > 60 else "")
+            lines.append(prompt_short)
+
+        # Draw text with black background for readability
+        y_offset = 5
+        for line in lines:
+            bbox = draw.textbbox((5, y_offset), line)
+            draw.rectangle(
+                [bbox[0] - 2, bbox[1] - 2, bbox[2] + 2, bbox[3] + 2], fill="black"
+            )
+            draw.text((5, y_offset), line, fill="white")
+            y_offset = bbox[3] + 5
+
+        annotated_imgs.append(
+            torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).float() / 255.0
+        )
+
+    # Make grid and save
+    grid = torchvision.utils.make_grid(
+        annotated_imgs, nrow=min(B, 4), padding=4, pad_value=1.0
+    )
+    grid_np = (grid.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    filename = f"ep{ep}_iter{it}_git{g_it}.png"
+    PImage.fromarray(grid_np).save(os.path.join(batch_dir, filename))
+    print(f"     [train_batch_vis] Saved {filename} ({B} images)")
+
+
 def build_everything(args: arg_util.Args):
     # resume
     auto_resume_info, start_ep, start_it, trainer_state = auto_resume(
         args, "ar-ckpt*.pth"
     )
     start_ep = 0 if args.from_0 else start_ep
+
+    # Save config as YAML in output directory
+    if dist.is_master():
+        import yaml
+
+        config_dict = vars(args)
+        # Filter out non-serializable objects
+        config_filtered = {}
+        for key, value in config_dict.items():
+            try:
+                if isinstance(
+                    value, (str, int, float, bool, list, dict, tuple, type(None))
+                ):
+                    config_filtered[key] = value
+            except:
+                pass
+
+        config_save_path = os.path.join(args.local_out_dir_path, "config.yaml")
+        os.makedirs(args.local_out_dir_path, exist_ok=True)
+        with open(config_save_path, "w") as f:
+            yaml.dump(config_filtered, f, default_flow_style=False, sort_keys=False)
+        print(f"[Config] Saved configuration to: {config_save_path}")
+
     # create tensorboard logger
     tb_lg: misc.TensorboardLogger
     with_tb_lg = dist.is_master()
     if with_tb_lg:
         os.makedirs(args.tb_log_dir_path, exist_ok=True)
+        # Initialize WandB logger (replaces TensorboardLogger)
         # noinspection PyTypeChecker
         tb_lg = misc.DistLogger(
-            misc.TensorboardLogger(
-                log_dir=args.tb_log_dir_path,
-                filename_suffix=f"__{misc.time_str('%m%d_%H%M')}",
-            ),
+            init_wandb_logger(args),
             verbose=True,
         )
         tb_lg.flush()
@@ -876,7 +987,7 @@ def train_one_ep(
 
         # Extract camera parameters if present (for ray adaptation training)
         cam_dir = None
-        fov_deg = 100.0  # Default FOV
+        fov_deg = 120.0  # Default FOV
         if "cam_dir" in obj:
             # cam_dir from DataLoader default collate: list of 2 tensors [lons, lats]
             # where each tensor has batch_size elements
@@ -944,6 +1055,16 @@ def train_one_ep(
                 if isinstance(obj["fov_deg"], torch.Tensor)
                 else obj["fov_deg"]
             )
+
+        # Save 3 training batch visualizations per epoch (evenly spaced)
+        n_batch_saves = 3
+        batch_save_interval = max(1, iters_train // n_batch_saves)
+        if (
+            dist.is_local_master()
+            and it % batch_save_interval == 0
+            and it // batch_save_interval < n_batch_saves
+        ):
+            save_training_batch_images(inp, obj, ep, it, g_it, args.local_out_dir_path)
 
         args.cur_it = f"{it + 1}/{iters_train}"
 

@@ -723,6 +723,8 @@ class ModifiedAttnBlock(AttnBlock):
         cam_dir=None,
         theta=None,
         camera_embedder=None,
+        # Metrics collection flag
+        collect_metrics=False,
     ):
         """
         Forward pass with optional ray adaptation.
@@ -733,7 +735,13 @@ class ModifiedAttnBlock(AttnBlock):
         3. dx_ray = RayAdapter(u, memory, theta)  # Ray adapter (trainable)
         4. x = x + DropPath(dx_self_base) + gate(c_t) * dx_ray  # Combined residual
         5. [frozen cross-attn and FFN continue as original]
+
+        Returns:
+            x: Output tensor
+            metrics: Dict with ray adapter metrics (if collect_metrics=True), else None
         """
+        metrics = {} if collect_metrics else None
+
         # Compute scale and shift for adaptive layer norm
         if self.shared_aln and cond_BD is not None:
             gamma1, gamma2, scale1, scale2, shift1, shift2 = (
@@ -773,6 +781,28 @@ class ModifiedAttnBlock(AttnBlock):
             gate_val = self.gate(c_t)  # (B, 1, 1)
             dx_ray = self.ray_adapter(u, memory, theta)  # (B, L, 1920)
 
+            # Collect metrics if requested
+            if collect_metrics:
+                with torch.no_grad():
+                    # Gate metrics: mean absolute gate value across batch
+                    metrics["gate_abs_mean"] = gate_val.abs().mean().item()
+                    metrics["gate_mean"] = gate_val.mean().item()
+                    metrics["gate_std"] = gate_val.std().item()
+
+                    # Activation norms
+                    metrics["dx_self_base_norm"] = (
+                        dx_self_base.norm(dim=-1).mean().item()
+                    )
+                    metrics["dx_ray_norm"] = dx_ray.norm(dim=-1).mean().item()
+
+                    # Weight norms (Frobenius norm of weight matrices)
+                    metrics["p_down_weight_norm"] = (
+                        self.ray_adapter.p_down.weight.norm().item()
+                    )
+                    metrics["p_up_weight_norm"] = (
+                        self.ray_adapter.p_up.weight.norm().item()
+                    )
+
             # 4. CRITICAL: Add ray residual at self-attention junction
             x = x + self.drop_path(dx_self_base.mul_(gamma1)) + gate_val * dx_ray
         else:
@@ -806,4 +836,6 @@ class ModifiedAttnBlock(AttnBlock):
             self.ffn(self.ln_wo_grad(x).mul(scale2 + 1).add_(shift2)).mul(gamma2)
         )
 
+        if collect_metrics:
+            return x, metrics
         return x

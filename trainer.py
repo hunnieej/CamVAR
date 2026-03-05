@@ -140,11 +140,12 @@ class VARTrainer(object):
 
         # Get loxodrome parameters from args (same as training)
         loxodrome_params = getattr(args, "erp_loxodrome_params", {})
-        lat0_deg = loxodrome_params.get("lat0", -60)
-        lat1_deg = loxodrome_params.get("lat1", 60)
+        lat0_deg = loxodrome_params.get("lat0", -55)
+        lat1_deg = loxodrome_params.get("lat1", 55)
         lon0_deg = loxodrome_params.get("lon0", 0)
-        bearing_deg = loxodrome_params.get("bearing", 45)
+        bearing_deg = loxodrome_params.get("bearing", 15)
         spacing = loxodrome_params.get("spacing", "rhumb")
+        # print(fov_deg, lat0_deg, lat1_deg, lon0_deg, bearing_deg, spacing)
 
         # Generate camera directions using same trajectory as training
         camera_trajectory = generate_validation_camera_dirs(
@@ -242,7 +243,7 @@ class VARTrainer(object):
 
             self.var_wo_ddp.forward
             print(f"===========> in eval_ep before var forward")
-            logits_BLV, _, drop_idxs = self.var(
+            logits_BLV, _, drop_idxs, _ = self.var(
                 x_BLCv_wo_first_l=x_BLCv_wo_first_l,  # 输入的是fhat，预测的是残差
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
@@ -348,13 +349,16 @@ class VARTrainer(object):
 
         with self.var_opt.amp_ctx:
             self.var_wo_ddp.forward
-            logits_BLV, _, drop_idxs = self.var(
+            # Collect metrics every 200 iterations
+            collect_metrics = it % 200 == 0
+            logits_BLV, _, drop_idxs, ray_metrics = self.var(
                 x_BLCv_wo_first_l=x_BLCv_wo_first_l,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=attn_mask,
                 encoder_pool_feat=pooled_embed,
                 cam_dir=cam_dir,
                 fov_deg=fov_deg,
+                collect_metrics=collect_metrics,
             )
             if not drop_idxs == None:
                 gt_BL = gt_BL[:, drop_idxs]
@@ -407,7 +411,7 @@ class VARTrainer(object):
                     acc_tail = (
                         pred_BL[:, last_l:] == gt_BL[:, last_l:]
                     ).float().mean().item() * 100
-            grad_norm = grad_norm.item()
+            grad_norm = grad_norm.item() if grad_norm is not None else 0.0
             metric_lg.update(
                 Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm
             )
@@ -449,6 +453,10 @@ class VARTrainer(object):
                     prog_wp=prog_wp,
                     step=g_it,
                 )
+
+                # Log ray adapter metrics if collected
+                if ray_metrics is not None:
+                    tb_lg.update(head="ray_adapter_metrics", **ray_metrics, step=g_it)
 
         self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = -1
         return grad_norm, scale_log2
@@ -545,7 +553,7 @@ class VARTrainer(object):
             else:  # not in progressive training
                 Ltail = Lmean
                 acc_tail = acc_mean
-            grad_norm = grad_norm.item()
+            grad_norm = grad_norm.item() if grad_norm is not None else 0.0
             metric_lg.update(
                 Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm
             )

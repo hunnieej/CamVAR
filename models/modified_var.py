@@ -813,6 +813,8 @@ class ModifiedVAR(nn.Module):
         cam_dir: Optional[torch.Tensor] = None,
         fov_deg: float = 100.0,
         patch_size: int = 16,
+        # Metrics collection
+        collect_metrics: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass with optional ray adaptation.
@@ -821,6 +823,13 @@ class ModifiedVAR(nn.Module):
             cam_dir: (B, 3) camera direction unit vectors (only used if enable_ray_adaptation=True)
             fov_deg: Field of view in degrees
             patch_size: Patch size for ray construction
+            collect_metrics: Whether to collect ray adapter metrics
+
+        Returns:
+            logits_BLV: Output logits
+            x_BLC: Final feature map
+            drop_idxs: Indices of dropped tokens (if any)
+            aggregated_metrics: Dict with aggregated metrics (if collect_metrics=True), else None
         """
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l.shape[0]
@@ -904,9 +913,14 @@ class ModifiedVAR(nn.Module):
             drop_idxs = None
 
         # Transformer blocks with ray adaptation
+        # Collect metrics per block if requested
+        block_metrics_list = (
+            [] if (collect_metrics and self.enable_ray_adaptation) else None
+        )
+
         for i, b in enumerate(self.blocks):
             if self.enable_ray_adaptation:
-                x_BLC = b(
+                result = b(
                     x=x_BLC,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
@@ -919,7 +933,15 @@ class ModifiedVAR(nn.Module):
                     theta=theta,
                     cam_dir=cam_dir,
                     camera_embedder=self.camera_embedder,
+                    collect_metrics=collect_metrics,
                 )
+
+                # Handle return value (may be tuple if metrics collected)
+                if collect_metrics:
+                    x_BLC, block_metrics = result
+                    block_metrics_list.append(block_metrics)
+                else:
+                    x_BLC = result
             else:
                 x_BLC = b(
                     x=x_BLC,
@@ -939,7 +961,25 @@ class ModifiedVAR(nn.Module):
             pass
 
         logits_BLV = self.get_logits(x_BLC.float())
-        return logits_BLV, x_BLC, drop_idxs
+
+        # Aggregate metrics if collected
+        aggregated_metrics = None
+        if collect_metrics and block_metrics_list:
+            aggregated_metrics = {}
+            metric_keys = block_metrics_list[0].keys()
+
+            # Compute mean and std across blocks for each metric
+            for key in metric_keys:
+                values = [m[key] for m in block_metrics_list]
+                aggregated_metrics[f"{key}_mean"] = sum(values) / len(values)
+
+                # Compute std for gate metrics only (most important)
+                if "gate" in key:
+                    mean_val = aggregated_metrics[f"{key}_mean"]
+                    variance = sum((v - mean_val) ** 2 for v in values) / len(values)
+                    aggregated_metrics[f"{key}_std_across_blocks"] = variance**0.5
+
+        return logits_BLV, x_BLC, drop_idxs, aggregated_metrics
 
     def forward_sampler(
         self,
@@ -950,7 +990,7 @@ class ModifiedVAR(nn.Module):
         embed_Cvae=None,
     ):
         with torch.no_grad():
-            logits_BLV, feat_BlC, _ = self.forward(
+            logits_BLV, feat_BlC, _, _ = self.forward(
                 x_BLCv_wo_first_l=x_BLCv_wo_first_l,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
