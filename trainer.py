@@ -111,7 +111,15 @@ class VARTrainer(object):
 
     @torch.no_grad()
     def inference_pic(
-        self, args, text_enc, cur_ep, cur_iter, top_k=600, top_p=0.8, w_mask=False
+        self,
+        args,
+        text_enc,
+        cur_ep,
+        cur_iter,
+        top_k=600,
+        top_p=0.8,
+        w_mask=False,
+        tb_lg=None,
     ):
         seed = 4  # @param {type:"number"}
         # seed
@@ -183,7 +191,7 @@ class VARTrainer(object):
                 cam_dir = cam_dir.expand(B_, 3)  # (B_, 3)
 
                 with torch.inference_mode():
-                    recon_B3HW = self.var_wo_ddp.autoregressive_infer_cfg(
+                    result = self.var_wo_ddp.autoregressive_infer_cfg(
                         B=B_,
                         label_B=label,
                         encoder_hidden_states=prompt_embeds,
@@ -198,7 +206,53 @@ class VARTrainer(object):
                         cam_dir=cam_dir,
                         fov_deg=fov_deg,
                         patch_size=patch_size,
+                        # Collect gate metrics during inference
+                        collect_metrics=True,
                     )
+
+                    # Handle return value (tuple if metrics collected)
+                    if isinstance(result, tuple):
+                        recon_B3HW, gate_metrics = result
+
+                        # Log gate metrics to WandB per view
+                        if tb_lg is not None and gate_metrics is not None:
+                            # Compute global iteration for logging
+                            g_it = (
+                                cur_ep * 1000 + cur_iter
+                                if cur_iter >= 0
+                                else cur_ep * 1000
+                            )
+                            tb_lg.update(
+                                head=f"inference_gate_metrics/view{view_idx:02d}",
+                                gate_mean=gate_metrics["gate_mean"],
+                                gate_std=gate_metrics["gate_std"],
+                                step=g_it,
+                            )
+                            # Also log aggregated stats across all views (accumulated)
+                            if view_idx == 0:
+                                self._accumulated_gate_mean = []
+                                self._accumulated_gate_std = []
+                            self._accumulated_gate_mean.append(
+                                gate_metrics["gate_mean"]
+                            )
+                            self._accumulated_gate_std.append(gate_metrics["gate_std"])
+
+                            # Log summary after all views
+                            if view_idx == len(camera_trajectory) - 1:
+                                tb_lg.update(
+                                    head="inference_gate_metrics/summary",
+                                    gate_mean_across_views=sum(
+                                        self._accumulated_gate_mean
+                                    )
+                                    / len(self._accumulated_gate_mean),
+                                    gate_std_across_views=sum(
+                                        self._accumulated_gate_std
+                                    )
+                                    / len(self._accumulated_gate_std),
+                                    step=g_it,
+                                )
+                    else:
+                        recon_B3HW = result
 
                 # Save images with view index suffix
                 if osp.exists(save_path):

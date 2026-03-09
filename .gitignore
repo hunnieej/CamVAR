@@ -23,3 +23,8 @@ test_erp_integration.py
 test_ray_adaptation.py
 train_single_gpu.sh
 db_sample_view/
+docs/
+test_batch_gathering.py
+test_inference_gate_metrics.py
+test_2gpu_setup.sh
+verify_2gpu_setup.sh

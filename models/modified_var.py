@@ -537,8 +537,15 @@ class ModifiedVAR(nn.Module):
         cam_dir: Optional[torch.Tensor] = None,
         fov_deg: float = 100.0,
         patch_size: int = 16,
-    ) -> torch.Tensor:
-        """Autoregressive inference with optional ray adaptation."""
+        # Metrics collection flag
+        collect_metrics: bool = False,
+    ) -> Union[torch.Tensor, tuple]:
+        """Autoregressive inference with optional ray adaptation.
+
+        Returns:
+            If collect_metrics=False: torch.Tensor (generated image)
+            If collect_metrics=True: tuple (generated image, metrics dict)
+        """
         encoder_attention_mask = prepare_attn_mask(
             encoder_attention_mask=encoder_attention_mask
         )
@@ -616,6 +623,9 @@ class ModifiedVAR(nn.Module):
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
+        # Initialize metrics collection
+        all_gate_values = [] if collect_metrics else None
+
         for b in self.blocks:
             b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):
@@ -640,7 +650,7 @@ class ModifiedVAR(nn.Module):
 
             for i, b in enumerate(self.blocks):
                 if self.enable_ray_adaptation:
-                    x = b(
+                    result = b(
                         x=x,
                         encoder_hidden_states=encoder_hidden_states,
                         encoder_attention_mask=encoder_attention_mask,
@@ -653,7 +663,21 @@ class ModifiedVAR(nn.Module):
                         theta=theta_cur,
                         cam_dir=cam_dir_cfg,
                         camera_embedder=self.camera_embedder,
+                        # Metrics collection
+                        collect_metrics=collect_metrics,
                     )
+
+                    # Handle return value (tuple if metrics collected, else just x)
+                    if collect_metrics:
+                        x, block_metrics = result
+                        # Only store gate values (Option 3: lightweight)
+                        if (
+                            block_metrics is not None
+                            and "gate_abs_mean" in block_metrics
+                        ):
+                            all_gate_values.append(block_metrics["gate_abs_mean"])
+                    else:
+                        x = result
                 else:
                     x = b(
                         x=x,
@@ -717,10 +741,26 @@ class ModifiedVAR(nn.Module):
 
         for b in self.blocks:
             b.attn.kv_caching(False)
+
+        # Generate final image
         with torch.autocast(
             "cuda", enabled=False, dtype=torch.float32, cache_enabled=True
         ):
-            return self.vae_proxy[0].fhat_to_img(f_hat.float()).add_(1).mul_(0.5)
+            generated_img = (
+                self.vae_proxy[0].fhat_to_img(f_hat.float()).add_(1).mul_(0.5)
+            )
+
+        # Aggregate metrics if collected
+        if collect_metrics and all_gate_values:
+            # all_gate_values contains Python floats, convert to numpy for aggregation
+            gate_array = np.array(all_gate_values)  # (num_blocks,)
+            aggregated_metrics = {
+                "gate_mean": float(gate_array.mean()),
+                "gate_std": float(gate_array.std()),
+            }
+            return generated_img, aggregated_metrics
+        else:
+            return generated_img
 
     def drop_scale(
         self, x_BLC, attn_bias, freqs_cis, start_idx, num_tokens_to_drop=200
@@ -850,7 +890,7 @@ class ModifiedVAR(nn.Module):
             theta = None
             memory = None
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             sos = cond_BD = self.encoder_proj(encoder_pool_feat)
 
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(

@@ -14,9 +14,6 @@ set -ex
 # Batch size calculation: bs=8, ac=2, num_gpus=2 → per_gpu_batch = 8/2/2 = 2
 #=============================================================================
 
-# Activate conda environment
-source /home/mmai6k_jh/anaconda3/bin/activate SMGD
-
 # Use both GPUs (0 and 1)
 export CUDA_VISIBLE_DEVICES=0,1
 

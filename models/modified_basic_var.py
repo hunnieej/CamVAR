@@ -11,6 +11,7 @@ import os
 # import seaborn as sns
 from models.helpers import DropPath, drop_path
 from models.embed_rope import apply_rotary_emb
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 # this file only provides the 3 blocks used in VAR transformer
@@ -371,8 +372,12 @@ class Attention(nn.Module):
         else:
             # oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias, dropout_p=dropout_p,
             #                 layer_id=layer_id,type='cross' if self.is_cross else 'self').transpose(1, 2).reshape(B, L, C)
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=True, enable_math=True, enable_mem_efficient=True
+            with sdpa_kernel(
+                [
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.MATH,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                ]
             ):
                 oup = (
                     F.scaled_dot_product_attention(

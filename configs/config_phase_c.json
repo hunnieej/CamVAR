@@ -43,7 +43,7 @@
   "pretrained_ckpt": "ckpt/star_rope_d30_512-ar-ckpt-ep1-iter30000.pth",
   "text_enc": "clip",
   "text_enc_path": "ckpt/CLIP",
-  "local_out_dir_path": "outputs/260305_at3",
+  "local_out_dir_path": "outputs/260309_at5",
   "instance_prompt": "dataset/prompts/val_scenes_10.txt",
   
   "pn": "1_2_3_4_6_9_13_18_24_32",

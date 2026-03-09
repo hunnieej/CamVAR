@@ -60,8 +60,10 @@ def custom_collate_fn(batch):
 def save_training_batch_images(inp_B3HW, obj, ep, it, g_it, save_dir):
     """Save a batch of training input images with camera direction annotations.
 
+    In multi-GPU (DDP) mode, gathers batches from all ranks to visualize the complete global batch.
+
     Args:
-        inp_B3HW: Input image tensor (B, 3, H, W) in [-1, 1] range.
+        inp_B3HW: Input image tensor (B, 3, H, W) in [-1, 1] range (local batch per rank).
         obj: Data batch dict containing 'cam_dir', 'prompt', 'fov_deg', etc.
         ep: Current epoch.
         it: Current iteration within epoch.
@@ -74,6 +76,84 @@ def save_training_batch_images(inp_B3HW, obj, ep, it, g_it, save_dir):
     batch_dir = os.path.join(save_dir, "train_batch_vis")
     os.makedirs(batch_dir, exist_ok=True)
 
+    # Extract data from obj dict
+    cam_dir_batch = obj.get("cam_dir", None)
+    prompts = obj.get("prompt", [""] * inp_B3HW.shape[0])
+    fov_deg = obj.get("fov_deg", None)
+
+    # Gather batches from all ranks in DDP mode
+    if dist.initialized() and dist.get_world_size() > 1:
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+
+        # Gather image tensors from all ranks
+        local_B = inp_B3HW.shape[0]
+        gathered_imgs = [torch.zeros_like(inp_B3HW) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_imgs, inp_B3HW.contiguous())
+
+        # Gather camera directions (lon, lat tensors)
+        gathered_lon_lat = None
+        if (
+            cam_dir_batch is not None
+            and isinstance(cam_dir_batch, (list, tuple))
+            and len(cam_dir_batch) == 2
+        ):
+            lon_tensor, lat_tensor = cam_dir_batch
+            if isinstance(lon_tensor, torch.Tensor) and isinstance(
+                lat_tensor, torch.Tensor
+            ):
+                # Move tensors to same device as inp_B3HW (GPU) for NCCL all_gather
+                device = inp_B3HW.device
+                lon_tensor = lon_tensor.to(device)
+                lat_tensor = lat_tensor.to(device)
+
+                gathered_lons = [
+                    torch.zeros_like(lon_tensor) for _ in range(world_size)
+                ]
+                gathered_lats = [
+                    torch.zeros_like(lat_tensor) for _ in range(world_size)
+                ]
+                torch.distributed.all_gather(gathered_lons, lon_tensor.contiguous())
+                torch.distributed.all_gather(gathered_lats, lat_tensor.contiguous())
+                gathered_lon_lat = (torch.cat(gathered_lons), torch.cat(gathered_lats))
+
+        # Gather prompts (string lists - need to use object list)
+        gathered_prompts = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_prompts, prompts)
+        all_prompts = []
+        for prompt_list in gathered_prompts:
+            if prompt_list is not None:
+                all_prompts.extend(prompt_list)
+
+        # Gather fov_deg
+        gathered_fov = None
+        if fov_deg is not None:
+            if isinstance(fov_deg, torch.Tensor):
+                # Move tensor to same device as inp_B3HW (GPU) for NCCL all_gather
+                device = inp_B3HW.device
+                fov_deg = fov_deg.to(device)
+
+                gathered_fov_list = [
+                    torch.zeros_like(fov_deg) for _ in range(world_size)
+                ]
+                torch.distributed.all_gather(gathered_fov_list, fov_deg.contiguous())
+                gathered_fov = torch.cat(gathered_fov_list)
+            else:
+                # fov_deg is a scalar, replicate for all gathered images
+                total_B = local_B * world_size
+                gathered_fov = [fov_deg] * total_B
+
+        # Update with gathered tensors
+        inp_B3HW = torch.cat(gathered_imgs, dim=0)
+        cam_dir_batch = gathered_lon_lat
+        prompts = all_prompts
+        fov_deg = gathered_fov
+
+        # Only rank 0 needs to process and save images
+        # Other ranks return after participating in all_gather
+        if rank != 0:
+            return
+
     # Denormalize from [-1, 1] to [0, 255]
     imgs = inp_B3HW.detach().cpu().float()
     imgs = (imgs + 1.0) * 0.5  # [-1,1] -> [0,1]
@@ -81,11 +161,6 @@ def save_training_batch_images(inp_B3HW, obj, ep, it, g_it, save_dir):
 
     B = imgs.shape[0]
     H, W = imgs.shape[2], imgs.shape[3]
-
-    # Extract camera info
-    cam_dir_batch = obj.get("cam_dir", None)
-    prompts = obj.get("prompt", [""] * B)
-    fov_deg = obj.get("fov_deg", None)
 
     # Parse (lon, lat) from collated cam_dir
     lon_lat_list = []
@@ -114,9 +189,12 @@ def save_training_batch_images(inp_B3HW, obj, ep, it, g_it, save_dir):
             lon_d, lat_d = lon_lat_list[i]
             lines.append(f"lon={lon_d:.1f} lat={lat_d:.1f}")
         if fov_deg is not None:
-            fov_val = (
-                fov_deg[i].item() if isinstance(fov_deg, torch.Tensor) else fov_deg
-            )
+            if isinstance(fov_deg, torch.Tensor):
+                fov_val = fov_deg[i].item()
+            elif isinstance(fov_deg, list):
+                fov_val = fov_deg[i]
+            else:
+                fov_val = fov_deg
             lines.append(f"fov={fov_val:.0f}")
         if i < len(prompts):
             prompt_short = prompts[i][:60] + ("..." if len(prompts[i]) > 60 else "")
@@ -136,14 +214,21 @@ def save_training_batch_images(inp_B3HW, obj, ep, it, g_it, save_dir):
             torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).float() / 255.0
         )
 
-    # Make grid and save
+    # Make grid with 2x2 layout for better visualization
+    # nrow=2 creates 2 columns, so with 4 images we get a 2x2 grid
+    nrow = 2 if B == 4 else min(B, 4)
     grid = torchvision.utils.make_grid(
-        annotated_imgs, nrow=min(B, 4), padding=4, pad_value=1.0
+        annotated_imgs, nrow=nrow, padding=4, pad_value=1.0
     )
     grid_np = (grid.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     filename = f"ep{ep}_iter{it}_git{g_it}.png"
     PImage.fromarray(grid_np).save(os.path.join(batch_dir, filename))
-    print(f"     [train_batch_vis] Saved {filename} ({B} images)")
+
+    # Include world size info in log message for multi-GPU
+    gpu_info = ""
+    if dist.initialized() and dist.get_world_size() > 1:
+        gpu_info = f" [gathered from {dist.get_world_size()} GPUs]"
+    print(f"     [train_batch_vis] Saved {filename} ({B} images{gpu_info})")
 
 
 def build_everything(args: arg_util.Args):
@@ -736,6 +821,7 @@ def main_training():
                     top_k=600,
                     top_p=0.8,
                     w_mask=False,
+                    tb_lg=tb_lg,
                 )
                 torch.cuda.empty_cache()
                 print(
@@ -956,6 +1042,7 @@ def train_one_ep(
                     top_k=600,
                     top_p=0.8,
                     w_mask=False,
+                    tb_lg=tb_lg,
                 )
                 torch.cuda.empty_cache()
                 print(
@@ -1057,13 +1144,10 @@ def train_one_ep(
             )
 
         # Save 3 training batch visualizations per epoch (evenly spaced)
+        # All ranks must participate to avoid deadlock in collective operations
         n_batch_saves = 3
         batch_save_interval = max(1, iters_train // n_batch_saves)
-        if (
-            dist.is_local_master()
-            and it % batch_save_interval == 0
-            and it // batch_save_interval < n_batch_saves
-        ):
+        if it % batch_save_interval == 0 and it // batch_save_interval < n_batch_saves:
             save_training_batch_images(inp, obj, ep, it, g_it, args.local_out_dir_path)
 
         args.cur_it = f"{it + 1}/{iters_train}"
