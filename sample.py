@@ -14,6 +14,12 @@ from models import build_vae_var
 from models.text_encoder import build_text
 
 
+PATCH_PRESETS = {
+    "512": [1, 2, 3, 4, 6, 9, 13, 18, 24, 32],
+    "1024": [1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64],
+}
+
+
 def save_images(sample_imgs, sample_folder_dir, store_separately, prompts, seed=1):
     if not store_separately and len(sample_imgs) > 1:
         grid = torchvision.utils.make_grid(sample_imgs, nrow=12)
@@ -46,77 +52,123 @@ def main(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    model_ckpt = torch.load(args.model_path, map_location="cpu")
+    var_state = model_ckpt["trainer"]["var_wo_ddp"]
+
+    if args.patch_nums is not None and len(args.patch_nums) > 0:
+        patch_nums = args.patch_nums
+    else:
+        num_levels = var_state["lvl_embed.weight"].shape[0]
+        if num_levels == 10:
+            patch_nums = PATCH_PRESETS["512"]
+        elif num_levels == 14:
+            patch_nums = PATCH_PRESETS["1024"]
+        else:
+            raise ValueError(
+                f"Unsupported number of levels in checkpoint: {num_levels}. "
+                "Please pass --patch_nums explicitly."
+            )
+        print(f"[sample] Auto-detected patch_nums from checkpoint: {patch_nums}")
+
     vae_model, var_model = build_vae_var(
-        V=4096, Cvae=32, ch=160, share_quant_resi=4,        # hard-coded VQVAE hyperparameters
-        device=device, patch_nums=args.patch_nums,
-        depth=args.depth, shared_aln=False, attn_l2_norm=True,
+        V=4096,
+        Cvae=32,
+        ch=160,
+        share_quant_resi=4,  # hard-coded VQVAE hyperparameters
+        device=device,
+        patch_nums=patch_nums,
+        depth=args.depth,
+        shared_aln=False,
+        attn_l2_norm=True,
         enable_cross=True,
         in_dim_cross=1024,
-        flash_if_available=False, fused_if_available=True,
-        init_adaln=0.5, init_adaln_gamma=5e-5, init_head=0.02, init_std=-1,
-        rope_emb=True,lvl_emb=True,
+        flash_if_available=False,
+        fused_if_available=True,
+        init_adaln=0.5,
+        init_adaln_gamma=5e-5,
+        init_head=0.02,
+        init_std=-1,
+        rope_emb=True,
+        lvl_emb=True,
         enable_logit_norm=args.enable_logit_norm,
         enable_adaptive_norm=False,
-        train_mode='none',
+        train_mode="none",
         rope_theta=10000,
-        rope_norm=64.0,
-        sample_from_idx=9
+        rope_norm=64,
+        sample_from_idx=9,
     )
 
-    vae_model.load_state_dict(torch.load(args.vae_path, map_location='cpu'), strict=True)
-    var_model.load_state_dict(torch.load(args.model_path, map_location='cpu')["trainer"]["var_wo_ddp"], strict=True)
+    vae_model.load_state_dict(
+        torch.load(args.vae_path, map_location="cpu"), strict=True
+    )
+    var_model.load_state_dict(var_state, strict=True)
 
     vae_model.eval()
     var_model.eval()
 
-    text_encoder, _ = build_text(pretrained_path=args.text_model_path,device=device)
+    text_encoder, _ = build_text(pretrained_path=args.text_model_path, device=device)
     text_encoder.eval()
 
     prompts = []
     if args.prompt:
         prompts = [args.prompt]
     elif args.prompt_list:
-        prompts = args.prompts
+        prompts = args.prompt_list
     else:
         prompts = [
-            "A red car.",
-            "A cute dog.",
-            "A banana in a plate.",
-            "A giraffe.",
-            "A red car and a white sheep.",
-            "A blue bird on a tree.",
-            "A green apple on the table.",
-            "A green cup and a blue cell phone.",
+            "A luxurious hotel suite with modern furnishings and warm lighting, shot with a wide-angle lens, lit by ambient light, in a sophisticated and inviting style.",
         ]
 
     start_time = time.time()
 
     batch_size = args.batch_size
+    output_imgs = None
     for batch_prompt in range(0, len(prompts), batch_size):
-        prompt = prompts[batch_prompt:batch_prompt+batch_size]
+        prompt = prompts[batch_prompt : batch_prompt + batch_size]
         with torch.no_grad():
             with torch.inference_mode():
-                prompt_embeds,prompt_attention_mask,pooled_embed = text_encoder.extract_text_features(prompt+[""]*batch_size)
-                with torch.autocast('cuda', enabled=True, dtype=torch.float16, cache_enabled=True):    # using bfloat16 can be faster
-                    recon_B3HW = var_model.autoregressive_infer_cfg(B=batch_size, label_B=None, 
-                                encoder_hidden_states=prompt_embeds,
-                                encoder_attention_mask=prompt_attention_mask,
-                                encoder_pool_feat=pooled_embed,
-                                cfg=args.cfg, top_k=args.top_k,
-                                top_p=args.top_p, g_seed=args.seed,
-                                more_smooth=False,
-                                w_mask=True,
-                                sample_version='1024'
-                            )
-        
-        output_imgs = recon_B3HW if not "output_imgs" in locals() else torch.cat([output_imgs, recon_B3HW], dim=0)
-    
+                prompt_embeds, prompt_attention_mask, pooled_embed = (
+                    text_encoder.extract_text_features(prompt + [""] * batch_size)
+                )
+                with torch.autocast(
+                    "cuda", enabled=True, dtype=torch.float16, cache_enabled=True
+                ):  # using bfloat16 can be faster
+                    recon_B3HW = var_model.autoregressive_infer_cfg(
+                        B=batch_size,
+                        label_B=None,
+                        encoder_hidden_states=prompt_embeds,
+                        encoder_attention_mask=prompt_attention_mask,
+                        encoder_pool_feat=pooled_embed,
+                        cfg=args.cfg,
+                        top_k=args.top_k,
+                        top_p=args.top_p,
+                        g_seed=args.seed,
+                        more_smooth=False,
+                        w_mask=True,
+                        sample_version="1024",
+                    )
+
+        output_imgs = (
+            recon_B3HW
+            if output_imgs is None
+            else torch.cat([output_imgs, recon_B3HW], dim=0)
+        )
+
     end_time = time.time()
     inference_time = end_time - start_time
     print(f"Generate {len(prompts)} images take {inference_time:2f}s.")
 
+    if output_imgs is None:
+        raise ValueError(
+            "No outputs were generated. Please provide at least one prompt."
+        )
+
     save_images(
-        output_imgs.clone(), args.sample_folder_dir, args.store_seperately, prompts, args.seed
+        output_imgs.clone(),
+        args.sample_folder_dir,
+        args.store_seperately,
+        prompts,
+        args.seed,
     )
 
 
@@ -126,19 +178,19 @@ if __name__ == "__main__":
         "--model_path",
         type=str,
         help="The path to STAR model.",
-        default="pretrained_models/STAR.pth",
+        default="ckpt/star_rope_d30_512-ar-ckpt-ep1-iter30000.pth",
     )
     parser.add_argument(
         "--text_model_path",
         type=str,
         help="The path to text model.",
-        default="pretrained_models/SDXl_CLIP",
+        default="ckpt/CLIP",
     )
     parser.add_argument(
         "--vae_path",
         type=str,
         help="The path to VAE model.",
-        default="pretrained_models/VAE.pth",
+        default="ckpt/vae_ch160v4096z32.pth",
     )
     parser.add_argument(
         "--cfg", type=float, help="Classifier-free guidance scale.", default=4.5
@@ -157,9 +209,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--patch_nums",
-        type=list,
-        help="The patch numbers for the model.",
-        default=[1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64],
+        type=int,
+        nargs="+",
+        help="Patch numbers for the model. If omitted, auto-detect from checkpoint.",
+        default=None,
     )
     parser.add_argument(
         "--depth",

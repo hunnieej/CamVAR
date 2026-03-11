@@ -42,90 +42,6 @@ class SharedAdaLin(nn.Linear):  # 1,L,C
         return super().forward(cond_BD).view(B, L, 6, C)  # B16C
 
 
-class RayConstructor:
-    """Constructs world-space ray directions from camera parameters and token grid."""
-
-    @staticmethod
-    def construct_rays(
-        token_grid_buffers: TokenGridBuffers,
-        cam_dir: torch.Tensor,  # (B, 3) - unit vector
-        fov_deg: float = 100.0,
-        patch_size: int = 16,
-    ) -> torch.Tensor:
-        """
-        Construct world-space ray directions for each token.
-
-        Returns:
-            r_world: (B, L, 3) - unit ray directions in world space
-        """
-        B = cam_dir.shape[0]
-        device = cam_dir.device
-        L = token_grid_buffers.L
-
-        # Get token grid coordinates - all (L,) tensors on device
-        u_coords = token_grid_buffers.u_coords.to(device)  # (L,) - patch u coordinate
-        v_coords = token_grid_buffers.v_coords.to(device)  # (L,) - patch v coordinate
-        patch_sizes = token_grid_buffers.patch_sizes.to(
-            device
-        )  # (L,) - patch size for this token
-
-        # Compute pixel coordinates for each token's center
-        # Each token represents a patch_size x patch_size region
-        pixel_u = (u_coords.float() + 0.5) * patch_sizes.float() * patch_size  # (L,)
-        pixel_v = (v_coords.float() + 0.5) * patch_sizes.float() * patch_size  # (L,)
-
-        # Image dimensions (assume square for simplicity)
-        # Largest scale: 32x32 patches * 16 pixels/patch = 512x512 image
-        H = W = 32 * patch_size
-
-        # Normalize to NDC [-1, 1]
-        ndc_x = (pixel_u / W) * 2 - 1  # (L,)
-        ndc_y = (pixel_v / H) * 2 - 1  # (L,)
-
-        # Compute ray directions in camera space
-        fov_rad = math.radians(fov_deg)
-        focal_length = 0.5 / math.tan(fov_rad / 2)
-
-        # Camera space rays (pointing along +Z, X right, Y up)
-        r_cam_x = ndc_x / focal_length  # (L,)
-        r_cam_y = -ndc_y / focal_length  # (L,) - flip Y for image coordinates
-        r_cam_z = torch.ones_like(r_cam_x)  # (L,)
-
-        # Normalize camera-space rays
-        r_cam = torch.stack([r_cam_x, r_cam_y, r_cam_z], dim=-1)  # (L, 3)
-        r_cam = r_cam / r_cam.norm(dim=-1, keepdim=True)  # (L, 3)
-
-        # Build rotation matrix from camera direction to world space
-        # Camera looks along cam_dir, with up=[0,1,0]
-        cam_dir_norm = cam_dir / (cam_dir.norm(dim=-1, keepdim=True) + 1e-8)  # (B, 3)
-
-        # World up vector
-        world_up = torch.tensor([0.0, 1.0, 0.0], device=device).expand(B, 3)  # (B, 3)
-
-        # Camera right = cam_dir × world_up
-        cam_right = torch.cross(cam_dir_norm, world_up, dim=-1)  # (B, 3)
-        cam_right = cam_right / (cam_right.norm(dim=-1, keepdim=True) + 1e-8)  # (B, 3)
-
-        # Camera up = right × cam_dir
-        cam_up = torch.cross(cam_right, cam_dir_norm, dim=-1)  # (B, 3)
-        cam_up = cam_up / (cam_up.norm(dim=-1, keepdim=True) + 1e-8)  # (B, 3)
-
-        # Rotation matrix: [right | up | forward]
-        # R @ r_cam = r_world
-        # r_world = r_cam.x * right + r_cam.y * up + r_cam.z * forward
-        r_world = (
-            r_cam[:, 0:1].unsqueeze(0) * cam_right.unsqueeze(1)  # (1, L, 1) * (B, 1, 3)
-            + r_cam[:, 1:2].unsqueeze(0) * cam_up.unsqueeze(1)  # (1, L, 1) * (B, 1, 3)
-            + r_cam[:, 2:3].unsqueeze(0)
-            * cam_dir_norm.unsqueeze(1)  # (1, L, 1) * (B, 1, 3)
-        )  # (B, L, 3)
-
-        # Normalize (should already be normalized, but ensure numerical stability)
-        r_world = r_world / (r_world.norm(dim=-1, keepdim=True) + 1e-8)  # (B, L, 3)
-
-        return r_world
-
-
 class ModifiedVAR(nn.Module):
     def __init__(
         self,
@@ -162,6 +78,12 @@ class ModifiedVAR(nn.Module):
         adapter_dim=128,
         num_memory_tokens=32,
         ray_adapter_num_heads=4,
+        ray_adapter_head_dim=32,
+        adapter_active_scale_indices=None,  # List of scale indices [0-9] where adapter is active
+        gate_floor=0.0,
+        gate_max=0.1,
+        gate_init=0.03,
+        gate_temperature=1.0,
     ):
         super().__init__()
         # 0. hyperparameters
@@ -304,6 +226,43 @@ class ModifiedVAR(nn.Module):
                 adapter_dim=adapter_dim, mem_size=num_memory_tokens
             )
 
+            # Adapter scale selection
+            self.adapter_active_scale_indices = adapter_active_scale_indices
+            if adapter_active_scale_indices is None:
+                # Default: all scales active
+                self.adapter_active_scale_indices = list(range(len(patch_nums)))
+                print(
+                    f"[Ray Adaptation] Adapter active on ALL scales: {self.adapter_active_scale_indices}"
+                )
+            else:
+                print(
+                    f"[Ray Adaptation] Adapter active on scales: {adapter_active_scale_indices}"
+                )
+                # Validate indices
+                for idx in adapter_active_scale_indices:
+                    assert 0 <= idx < len(patch_nums), (
+                        f"Invalid scale index {idx}, must be in [0, {len(patch_nums) - 1}]"
+                    )
+
+            # Build scale mask: (1, L, 1) tensor with 1.0 for active-scale tokens, 0.0 otherwise
+            scale_mask = torch.zeros(1, self.L, 1, dtype=torch.float32)
+            for si in self.adapter_active_scale_indices:
+                start, end = self.begin_ends[si]
+                scale_mask[0, start:end, 0] = 1.0
+            self.register_buffer("adapter_scale_mask", scale_mask, persistent=False)
+            print(
+                f"[Ray Adaptation] Scale mask shape: {scale_mask.shape}, active tokens: {scale_mask.sum().item()}/{self.L}"
+            )
+
+            # Gate config (Option B): gate_floor is deprecated; gate is sigmoid-bounded
+            self.gate_floor = 0.0  # kept for compat; unused with Option B
+            self.gate_max = gate_max
+            self.gate_init = gate_init
+            self.gate_temperature = gate_temperature
+            print(
+                f"[Ray Adaptation] gate redesign (Option B): gate_max={gate_max}, gate_init={gate_init}, gate_temperature={gate_temperature}"
+            )
+
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.drop_path_rate = drop_path_rate
         dpr = [
@@ -312,7 +271,7 @@ class ModifiedVAR(nn.Module):
 
         # Build blocks - use ModifiedAttnBlock if ray adaptation is enabled
         if self.enable_ray_adaptation:
-            print("[Ray Adaptation] Using ModifiedAttnBlock for all transformer blocks")
+            # print("[Ray Adaptation] Using ModifiedAttnBlock for all transformer blocks")
             self.blocks = nn.ModuleList(
                 [
                     ModifiedAttnBlock(
@@ -335,6 +294,13 @@ class ModifiedVAR(nn.Module):
                         rotary_pos_emb=rotary_pos_emb,
                         # Ray adaptation parameters
                         enable_ray_adaptation=True,
+                        ray_adapter_dim=adapter_dim,
+                        ray_adapter_num_heads=ray_adapter_num_heads,
+                        ray_adapter_head_dim=ray_adapter_head_dim,
+                        gate_floor=0.0,
+                        gate_max=gate_max,
+                        gate_init=gate_init,
+                        gate_temperature=gate_temperature,
                     )
                     for block_idx in range(depth)
                 ]
@@ -563,8 +529,13 @@ class ModifiedVAR(nn.Module):
             cam_dir_cfg = torch.cat([cam_dir, cam_dir], dim=0)  # (2*B, 3)
 
             # Construct rays and compute theta
-            r_world = RayConstructor.construct_rays(
-                self.token_grid, cam_dir_cfg, fov_deg, patch_size
+            r_world = RayConstructor.compute_rays(
+                cam_dir_cfg,
+                self.token_grid.u_coords,
+                self.token_grid.v_coords,
+                self.token_grid.patch_sizes,
+                fov_deg,
+                patch_size,
             )  # (2*B, L, 3)
             # Note: cam_dir_cfg is kept as raw (2*B, 3) - blocks will embed it themselves
             theta = self.cam_rope(r_world)  # (2*B, L, 16)
@@ -646,6 +617,20 @@ class ModifiedVAR(nn.Module):
             theta_cur = (
                 theta[:, cur_L - pn * pn : cur_L, :] if theta is not None else None
             )
+
+            # Compute scale_mask for current scale: (1, pn*pn, 1) with 1.0 if si is active, 0.0 otherwise
+            if self.enable_ray_adaptation:
+                scale_active = si in self.adapter_active_scale_indices
+                scale_mask_cur = (
+                    torch.ones(1, pn * pn, 1, device=sos.device, dtype=torch.float32)
+                    if scale_active
+                    else torch.zeros(
+                        1, pn * pn, 1, device=sos.device, dtype=torch.float32
+                    )
+                )
+            else:
+                scale_mask_cur = None
+
             x = next_token_map
 
             for i, b in enumerate(self.blocks):
@@ -663,6 +648,7 @@ class ModifiedVAR(nn.Module):
                         theta=theta_cur,
                         cam_dir=cam_dir_cfg,
                         camera_embedder=self.camera_embedder,
+                        scale_mask=scale_mask_cur,  # Per-scale mask for inference
                         # Metrics collection
                         collect_metrics=collect_metrics,
                     )
@@ -877,8 +863,13 @@ class ModifiedVAR(nn.Module):
         # Prepare camera inputs if ray adaptation is enabled
         if self.enable_ray_adaptation and cam_dir is not None:
             # Construct rays and compute theta
-            r_world = RayConstructor.construct_rays(
-                self.token_grid, cam_dir, fov_deg, patch_size
+            r_world = RayConstructor.compute_rays(
+                cam_dir,
+                self.token_grid.u_coords,
+                self.token_grid.v_coords,
+                self.token_grid.patch_sizes,
+                fov_deg,
+                patch_size,
             )  # (B, L, 3)
             theta = self.cam_rope(r_world)  # (B, L, 16)
 
@@ -973,6 +964,7 @@ class ModifiedVAR(nn.Module):
                     theta=theta,
                     cam_dir=cam_dir,
                     camera_embedder=self.camera_embedder,
+                    scale_mask=self.adapter_scale_mask,  # (1, L, 1) mask for active scales
                     collect_metrics=collect_metrics,
                 )
 

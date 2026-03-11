@@ -31,11 +31,11 @@ depth=30
 enable_logit_norm=True
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-vae_ckpt='/path/to/vae'
-texenc_ckpt='/path/to/SDXL_CLIP'
+vae_ckpt='./ckpt/vae_ch160v4096z32.pth'
+texenc_ckpt='./ckpt/CLIP'
 
-patch_nums = [1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64]
-var_ckpt='./ckpts/var_rope_d30_1024_sampler_mask_0108-ar-ckpt-ep2-iter6000.pth'
+patch_nums = [1, 2, 3, 4, 6, 9, 13, 18, 24, 32]
+var_ckpt='./ckpt/star_rope_d30_512-ar-ckpt-ep1-iter30000.pth'
 
 # patch_nums = [1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64]
 # var_ckpt='./ckpts/var_rope_d30_1024_sampler_mask-ar-ckpt-ep1-iter26000.pth'

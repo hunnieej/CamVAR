@@ -561,7 +561,7 @@ class AttnBlock(nn.Module):
                 torch.randn(1, 1, 6, embed_dim) / embed_dim**0.5
             )
         self.cross_attn_ln = cross_attn_ln
-        print("cross_attention_layernorm: ", self.cross_attn_ln)
+        # print("cross_attention_layernorm: ", self.cross_attn_ln)
 
         self.fused_add_norm_fn = None
 

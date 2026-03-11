@@ -561,7 +561,7 @@ class AttnBlock(nn.Module):
                 torch.randn(1, 1, 6, embed_dim) / embed_dim**0.5
             )
         self.cross_attn_ln = cross_attn_ln
-        print("cross_attention_layernorm: ", self.cross_attn_ln)
+        # print("cross_attention_layernorm: ", self.cross_attn_ln)
 
         self.fused_add_norm_fn = None
 
@@ -680,6 +680,13 @@ class ModifiedAttnBlock(AttnBlock):
         rotary_pos_emb=True,
         # Ray adaptation parameters
         enable_ray_adaptation=False,
+        ray_adapter_dim=128,
+        ray_adapter_num_heads=4,
+        ray_adapter_head_dim=32,
+        gate_floor=0.0,  # kept for backward compat but unused with Option B gate
+        gate_max=0.1,
+        gate_init=0.03,
+        gate_temperature=1.0,
     ):
         super().__init__(
             block_idx,
@@ -703,16 +710,28 @@ class ModifiedAttnBlock(AttnBlock):
         )
 
         self.enable_ray_adaptation = enable_ray_adaptation
+        # gate_floor is no longer used — Option B gate is sigmoid-bounded
+        self.gate_floor = 0.0
 
         if enable_ray_adaptation:
             from .ray_adapter import RayAdapter, PerBlockGate
 
             self.ray_adapter = RayAdapter(
-                embed_dim=embed_dim, adapter_dim=128, num_heads=4, head_dim=32
+                embed_dim=embed_dim,
+                adapter_dim=ray_adapter_dim,
+                num_heads=ray_adapter_num_heads,
+                head_dim=ray_adapter_head_dim,
             )
-            self.gate = PerBlockGate(camera_dim=64)
+            self.gate = PerBlockGate(
+                camera_dim=64,
+                gate_max=gate_max,
+                gate_init=gate_init,
+                gate_temperature=gate_temperature,
+            )
 
-            print(f"Block {block_idx}: Ray adaptation enabled")
+            # print(
+            #     f"Block {block_idx}: Ray adaptation enabled (adapter_dim={ray_adapter_dim}, num_heads={ray_adapter_num_heads}, head_dim={ray_adapter_head_dim})"
+            # )
 
     def forward(
         self,
@@ -728,6 +747,7 @@ class ModifiedAttnBlock(AttnBlock):
         cam_dir=None,
         theta=None,
         camera_embedder=None,
+        scale_mask=None,  # (1, L, 1) tensor with 0/1 for inactive/active scale tokens
         # Metrics collection flag
         collect_metrics=False,
     ):
@@ -738,8 +758,12 @@ class ModifiedAttnBlock(AttnBlock):
         1. u = LN(x)  # Pre-norm
         2. dx_self_base = frozen_self_attn(u, ...)  # Frozen self-attention
         3. dx_ray = RayAdapter(u, memory, theta)  # Ray adapter (trainable)
-        4. x = x + DropPath(dx_self_base) + gate(c_t) * dx_ray  # Combined residual
+        4. x = x + DropPath(dx_self_base) + gate(c_t) * scale_mask * dx_ray  # Combined residual
         5. [frozen cross-attn and FFN continue as original]
+
+        Args:
+            scale_mask: (1, L, 1) or None - 0/1 mask for inactive/active scale tokens.
+                        If None, all tokens are active (default behavior).
 
         Returns:
             x: Output tensor
@@ -783,21 +807,28 @@ class ModifiedAttnBlock(AttnBlock):
             )
 
             c_t = camera_embedder(cam_dir)  # (B, 3) -> (B, 64)
-            gate_val = self.gate(c_t)  # (B, 1, 1)
+            gate_val = self.gate(
+                c_t
+            )  # (B, 1, 1) — already bounded by gate_max via sigmoid
             dx_ray = self.ray_adapter(u, memory, theta)  # (B, L, 1920)
-
+            gate_eff = (
+                gate_val  # no gate_floor needed; sigmoid ensures non-trivial gate
+            )
+            # print(c_t, gate_val, gate_eff, dx_ray)
             # Collect metrics if requested
             if collect_metrics:
                 with torch.no_grad():
-                    # Gate metrics: mean absolute gate value across batch
-                    metrics["gate_abs_mean"] = gate_val.abs().mean().item()
-                    metrics["gate_mean"] = gate_val.mean().item()
-                    metrics["gate_std"] = gate_val.std().item()
+                    # Gate metrics
+                    metrics["gate_abs_mean"] = gate_eff.abs().mean().item()
+                    metrics["gate_mean"] = gate_eff.mean().item()
+                    metrics["gate_std"] = gate_eff.std().item()
+                    metrics["gate_min"] = gate_eff.min().item()
+                    metrics["gate_max_val"] = gate_eff.max().item()
 
                     # Activation norms
-                    metrics["dx_self_base_norm"] = (
-                        dx_self_base.norm(dim=-1).mean().item()
-                    )
+                    dx_self_base_norm = dx_self_base.norm(dim=-1).mean().item()
+                    metrics["dx_self_base_norm"] = dx_self_base_norm
+
                     metrics["dx_ray_norm"] = dx_ray.norm(dim=-1).mean().item()
 
                     # Weight norms (Frobenius norm of weight matrices)
@@ -809,7 +840,25 @@ class ModifiedAttnBlock(AttnBlock):
                     )
 
             # 4. CRITICAL: Add ray residual at self-attention junction
-            x = x + self.drop_path(dx_self_base.mul_(gamma1)) + gate_val * dx_ray
+            # Apply scale_mask to zero out adapter contribution for inactive scales
+            if scale_mask is not None:
+                # scale_mask: (1, L, 1) - broadcast across batch dimension
+                dx_ray_masked = gate_eff * dx_ray * scale_mask
+            else:
+                # No masking - all scales active (default behavior)
+                dx_ray_masked = gate_eff * dx_ray
+
+            # Additional masked-norm metrics (after scale_mask is applied)
+            if collect_metrics:
+                with torch.no_grad():
+                    eps = 1e-8
+                    dx_ray_masked_norm = dx_ray_masked.norm(dim=-1).mean().item()
+                    metrics["dx_ray_masked_norm"] = dx_ray_masked_norm
+                    metrics["inj_ratio"] = dx_ray_masked_norm / (
+                        metrics["dx_self_base_norm"] + eps
+                    )
+
+            x = x + self.drop_path(dx_self_base.mul_(gamma1)) + dx_ray_masked
         else:
             # Original behavior without ray adaptation
             x = x + self.drop_path(dx_self_base.mul_(gamma1))

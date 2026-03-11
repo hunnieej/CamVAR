@@ -338,26 +338,12 @@ class MetricLogger(object):
 
     def log_every(self, start_it, max_iters, itrt, print_freq, header=None):
         # itrt: data loader
-        self.log_iters = set(
-            np.linspace(0, max_iters - 1, print_freq, dtype=int).tolist()
-        )
-        self.log_iters.add(start_it)
         if not header:
             header = ""
         start_time = time.time()
         self.iter_end_t = time.time()
         self.iter_time = SmoothedValue(fmt="{avg:.4f}")
         self.data_time = SmoothedValue(fmt="{avg:.4f}")
-        space_fmt = ":" + str(len(str(max_iters))) + "d"
-        log_msg = [
-            header,
-            "[{0" + space_fmt + "}/{1}]",
-            "eta: {eta}",
-            "{meters}",
-            "time: {time}",
-            "data: {data}",
-        ]
-        log_msg = self.delimiter.join(log_msg)
 
         # Create tqdm progress bar
         pbar = tqdm(
@@ -365,13 +351,12 @@ class MetricLogger(object):
             initial=start_it,
             desc=header,
             dynamic_ncols=True,
-            ascii=True,
+            ascii=False,
             position=0,
             leave=True,
-            file=sys.stderr,  # Write to stderr to avoid cluttering redirected stdout logs
-            mininterval=1.0,  # Update display at most once per second
-            ncols=80,  # Fixed width to prevent layout changes
-            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+            file=sys.stdout,
+            mininterval=0.5,  # Update display at most twice per second
+            bar_format="{desc} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
         )
 
         if (
@@ -385,12 +370,9 @@ class MetricLogger(object):
                 yield i, obj
                 self.iter_time.update(time.time() - self.iter_end_t)
 
-                # Update tqdm
-                pbar.update(1)
-
                 # Update tqdm postfix with current metrics
+                postfix_dict = {}
                 if len(self.meters) > 0:
-                    postfix_dict = {}
                     for name, meter in self.meters.items():
                         if len(meter.deque) > 0:
                             if name in ["Lm", "Lt"]:
@@ -399,22 +381,16 @@ class MetricLogger(object):
                                 postfix_dict[name] = f"{meter.median:.2f}"
                             elif name in ["tlr"]:
                                 postfix_dict[name] = f"{meter.value:.2g}"
-                    pbar.set_postfix(postfix_dict, refresh=False)  # Don't force refresh
+                            elif name in ["tnm"]:
+                                postfix_dict[name] = f"{meter.value:.2f}"
 
-                if i in self.log_iters:
-                    eta_seconds = self.iter_time.global_avg * (max_iters - i)
-                    eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                    print(
-                        log_msg.format(
-                            i,
-                            max_iters,
-                            eta=eta_string,
-                            meters=str(self),
-                            time=str(self.iter_time),
-                            data=str(self.data_time),
-                        ),
-                        flush=True,
-                    )
+                # Add time and data loading time
+                postfix_dict["time"] = f"{self.iter_time.avg:.3f}s"
+                postfix_dict["data"] = f"{self.data_time.avg:.3f}s"
+
+                pbar.set_postfix(postfix_dict)
+                pbar.update(1)
+
                 self.iter_end_t = time.time()
         else:
             if isinstance(itrt, int):
@@ -424,12 +400,9 @@ class MetricLogger(object):
                 yield i, obj
                 self.iter_time.update(time.time() - self.iter_end_t)
 
-                # Update tqdm
-                pbar.update(1)
-
                 # Update tqdm postfix with current metrics
+                postfix_dict = {}
                 if len(self.meters) > 0:
-                    postfix_dict = {}
                     for name, meter in self.meters.items():
                         if len(meter.deque) > 0:
                             if name in ["Lm", "Lt"]:
@@ -438,22 +411,16 @@ class MetricLogger(object):
                                 postfix_dict[name] = f"{meter.median:.2f}"
                             elif name in ["tlr"]:
                                 postfix_dict[name] = f"{meter.value:.2g}"
-                    pbar.set_postfix(postfix_dict, refresh=False)  # Don't force refresh
+                            elif name in ["tnm"]:
+                                postfix_dict[name] = f"{meter.value:.2f}"
 
-                if i in self.log_iters:
-                    eta_seconds = self.iter_time.global_avg * (max_iters - i)
-                    eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                    print(
-                        log_msg.format(
-                            i,
-                            max_iters,
-                            eta=eta_string,
-                            meters=str(self),
-                            time=str(self.iter_time),
-                            data=str(self.data_time),
-                        ),
-                        flush=True,
-                    )
+                # Add time and data loading time
+                postfix_dict["time"] = f"{self.iter_time.avg:.3f}s"
+                postfix_dict["data"] = f"{self.data_time.avg:.3f}s"
+
+                pbar.set_postfix(postfix_dict)
+                pbar.update(1)
+
                 self.iter_end_t = time.time()
 
         # Close tqdm progress bar
@@ -462,7 +429,7 @@ class MetricLogger(object):
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print(
-            "{}   Total time:      {}   ({:.3f} s / it)".format(
+            "{}   Total time: {} ({:.3f} s/it)".format(
                 header, total_time_str, total_time / max_iters
             ),
             flush=True,

@@ -102,7 +102,7 @@ def filter_params(model, nowd_keys=()) -> Tuple[
     for g in para_groups_dbg.values():
         g['params'] = pformat(', '.join(g['params']), width=200)
     
-    print(f'[get_param_groups] param_groups = \n{pformat(para_groups_dbg, indent=2, width=240)}\n')
+    # print(f'[get_param_groups] param_groups = \n{pformat(para_groups_dbg, indent=2, width=240)}\n')
     
     for rk in range(dist.get_world_size()):
         dist.barrier()

@@ -108,6 +108,7 @@ class VARTrainer(object):
         self.last_prog_si = -1
         self.first_prog = True
         self.mask_scheduler = Scheduler()
+        self.adapter_metrics_every = 0  # set from args after construction
 
     @torch.no_grad()
     def inference_pic(
@@ -206,8 +207,8 @@ class VARTrainer(object):
                         cam_dir=cam_dir,
                         fov_deg=fov_deg,
                         patch_size=patch_size,
-                        # Collect gate metrics during inference
-                        collect_metrics=True,
+                        # Collect gate metrics during inference if enabled
+                        collect_metrics=args.adapter_metrics_every > 0,
                     )
 
                     # Handle return value (tuple if metrics collected)
@@ -272,7 +273,6 @@ class VARTrainer(object):
 
     @torch.no_grad()
     def eval_ep(self, args, ld_val, text_enc):
-        print(f"===========> in eval_ep")
         # def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, text_enc, iters_train: int, trainer):
         tot = 0
         L_mean, L_tail, acc_mean, acc_tail = 0, 0, 0, 0
@@ -280,7 +280,7 @@ class VARTrainer(object):
         training = self.var_wo_ddp.training
         self.var_wo_ddp.eval()
         for _obj_idx, obj in enumerate(ld_val):
-            print(f"===========> in eval_ep {_obj_idx} / {len(ld_val)}")
+            # print(f"===========> in eval_ep {_obj_idx} / {len(ld_val)}")
             inp_B3HW = obj["image"].to(dist.get_device(), non_blocking=True)
             obj["prompt_embeds"] = text_enc.extract_text_features(obj["prompt"])
             encoder_hidden_states, encoder_attention_mask, pooled_embed = obj[
@@ -296,7 +296,7 @@ class VARTrainer(object):
             )  # 返回的是scale的插值结果
 
             self.var_wo_ddp.forward
-            print(f"===========> in eval_ep before var forward")
+            # print(f"===========> in eval_ep before var forward")
             logits_BLV, _, drop_idxs, _ = self.var(
                 x_BLCv_wo_first_l=x_BLCv_wo_first_l,  # 输入的是fhat，预测的是残差
                 encoder_hidden_states=encoder_hidden_states,
@@ -369,6 +369,7 @@ class VARTrainer(object):
         prog_wp_it: float,
         cam_dir: Optional[Ten] = None,
         fov_deg: float = 100.0,
+        args=None,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         # label_B是imagenet的class，inp_B3HW是输入图像
         # progressive training
@@ -403,8 +404,12 @@ class VARTrainer(object):
 
         with self.var_opt.amp_ctx:
             self.var_wo_ddp.forward
-            # Collect metrics every 200 iterations
-            collect_metrics = it % 200 == 0
+            # Collect adapter metrics based on unified interval (0 = off)
+            collect_metrics = False
+            if args is not None:
+                interval = getattr(args, "adapter_metrics_every", 0)
+                if interval > 0 and it % interval == 0:
+                    collect_metrics = True
             logits_BLV, _, drop_idxs, ray_metrics = self.var(
                 x_BLCv_wo_first_l=x_BLCv_wo_first_l,
                 encoder_hidden_states=encoder_hidden_states,
@@ -472,7 +477,8 @@ class VARTrainer(object):
             # accm是平均所有尺度的loss，acc_tail是最后一个level的loss
 
         # log to tensorboard
-        if g_it == 0 or (g_it + 1) % 200 == 0:
+        _log_interval = self.adapter_metrics_every
+        if g_it == 0 or (_log_interval > 0 and g_it % _log_interval == 0):
             prob_per_class_is_chosen = pred_BL.view(-1).bincount(minlength=V).float()
             dist.allreduce(prob_per_class_is_chosen)
             prob_per_class_is_chosen /= prob_per_class_is_chosen.sum()
@@ -613,7 +619,8 @@ class VARTrainer(object):
             )
 
         # log to tensorboard
-        if g_it == 0 or (g_it + 1) % 200 == 0:
+        _log_interval = self.adapter_metrics_every
+        if g_it == 0 or (_log_interval > 0 and g_it % _log_interval == 0):
             prob_per_class_is_chosen = pred_BL.view(-1).bincount(minlength=V).float()
             dist.allreduce(prob_per_class_is_chosen)
             prob_per_class_is_chosen /= prob_per_class_is_chosen.sum()
@@ -688,8 +695,8 @@ class VARTrainer(object):
                 ret = m.load_state_dict(state[k], strict=strict)
                 if ret is not None:
                     missing, unexpected = ret
-                    print(f"[VARTrainer.load_state_dict] {k} missing:  {missing}")
-                    print(f"[VARTrainer.load_state_dict] {k} unexpected:  {unexpected}")
+                    # print(f"[VARTrainer.load_state_dict] {k} missing:  {missing}")
+                    # print(f"[VARTrainer.load_state_dict] {k} unexpected:  {unexpected}")
 
         config: dict = state.pop("config", None)
         self.prog_it = config.get("prog_it", 0)

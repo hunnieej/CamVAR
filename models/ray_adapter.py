@@ -2,11 +2,13 @@
 RayAdapter: Ray-aware adaptation module with CameraAwareAttention.
 
 Implements:
-1. PerBlockGate: Per-block adaptive gate with zero initialization
+1. PerBlockGate: Per-block MLP gate with LayerNorm, sigmoid bounded output,
+                 and soft-open initialization (Option B redesign)
 2. CameraAwareAttention: Self-attention with CamRoPE and memory integration
 3. RayAdapter: Complete adapter module with P_down, SA_cam, P_up
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,48 +17,76 @@ from .camera_system import CamRoPE
 
 class PerBlockGate(nn.Module):
     """
-    Per-block adaptive gate with zero initialization.
+    Per-block adaptive gate — Option B redesign.
 
-    Input: camera features c_t (B, 64)
-    Output: gate value (B, 1, 1) broadcast over L and C
+    Architecture:
+        LayerNorm(c_t) → Linear(64→64) → SiLU → Linear(64→1) → gate_max * sigmoid(x / T)
 
-    CRITICAL: Must be initialized to exactly zero (weight=0, bias=0)
-    for "do no harm" start. No sigmoid unless it yields exactly 0 initially.
+    Initialization:
+        - First layer: default PyTorch init (Kaiming uniform)
+        - Final layer weights: small normal (std=0.01)
+        - Final layer bias: logit(gate_init / gate_max) so initial output ≈ gate_init
+
+    Input:  c_t  (B, 64) — camera features from CameraEmbedder
+    Output: gate (B, 1, 1) — broadcast over L and C dimensions
+
+    Args:
+        camera_dim:      Input feature dimension (default 64)
+        gate_max:        Upper bound on gate output (default 0.1)
+        gate_init:       Target initial gate value (default 0.03)
+        gate_temperature: Sigmoid temperature T (default 1.0)
     """
 
-    def __init__(self, camera_dim=64):
+    def __init__(
+        self,
+        camera_dim: int = 64,
+        gate_max: float = 0.1,
+        gate_init: float = 0.03,
+        gate_temperature: float = 1.0,
+    ):
         super().__init__()
 
-        self.gate_proj = nn.Linear(camera_dim, 1)
+        self.gate_max = gate_max
+        self.gate_temperature = gate_temperature
 
-        # ZERO initialization for gate
-        nn.init.zeros_(self.gate_proj.weight)
-        nn.init.zeros_(self.gate_proj.bias)
+        # Normalize camera features before the MLP
+        self.ln = nn.LayerNorm(camera_dim)
 
-        print(f"PerBlockGate initialized: camera_dim={camera_dim}, zero-initialized")
+        # MLP: 64 → 64 → 1
+        self.fc1 = nn.Linear(camera_dim, camera_dim)
+        self.act = nn.SiLU()
+        self.fc2 = nn.Linear(camera_dim, 1)
 
-    def forward(self, c_t):
+        # Soft-open initialization
+        # Solve: gate_max * sigmoid(bias / T) = gate_init
+        #   => sigmoid(bias / T) = gate_init / gate_max
+        #   => bias = T * logit(gate_init / gate_max)
+        ratio = gate_init / gate_max
+        # clamp ratio away from 0 and 1 to keep logit finite
+        ratio = max(1e-4, min(1 - 1e-4, ratio))
+        init_bias = gate_temperature * math.log(ratio / (1.0 - ratio))
+
+        # fc1: default PyTorch init (Kaiming), no change needed
+        # fc2: small weights, bias set to achieve soft-open target
+        nn.init.normal_(self.fc2.weight, mean=0.0, std=0.01)
+        nn.init.constant_(self.fc2.bias, init_bias)
+
+    def forward(self, c_t: torch.Tensor) -> torch.Tensor:
         """
-        c_t: (B, 64) - camera features
-        Returns: (B, 1, 1) - gate value to broadcast over L and C
+        c_t: (B, 64) — camera features
+        Returns: (B, 1, 1) — gate value in (0, gate_max)
         """
         B = c_t.shape[0]
         assert c_t.shape == (B, 64), f"Expected c_t shape (B, 64), got {c_t.shape}"
 
-        gate = self.gate_proj(c_t)  # (B, 1)
+        x = self.ln(c_t)  # (B, 64) — normalize scale
+        x = self.act(self.fc1(x))  # (B, 64)
+        x = self.fc2(x)  # (B, 1)
+        gate = self.gate_max * torch.sigmoid(
+            x / self.gate_temperature
+        )  # (B, 1) ∈ (0, gate_max)
         gate = gate.unsqueeze(2)  # (B, 1, 1)
-
         return gate
-
-    def verify_zero_init(self):
-        """Verify that gate is initialized to exactly zero."""
-        assert torch.allclose(
-            self.gate_proj.weight, torch.zeros_like(self.gate_proj.weight)
-        ), "Gate weight should be zero-initialized"
-        assert torch.allclose(
-            self.gate_proj.bias, torch.zeros_like(self.gate_proj.bias)
-        ), "Gate bias should be zero-initialized"
-        print("✓ Gate initialization verified: weight=0, bias=0")
 
 
 class CameraAwareAttention(nn.Module):
@@ -77,7 +107,8 @@ class CameraAwareAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.scale = 0.25 / (head_dim**0.5)
+        # self.scale = 0.25 / (head_dim**0.5)
+        self.scale = 1 / (head_dim**0.5)
 
         # Q projection (from tokens only)
         self.q_proj = nn.Linear(dim, num_heads * head_dim, bias=False)
@@ -91,9 +122,9 @@ class CameraAwareAttention(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(num_heads * head_dim, dim)
 
-        print(
-            f"CameraAwareAttention initialized: dim={dim}, num_heads={num_heads}, head_dim={head_dim}"
-        )
+        # print(
+        #     f"CameraAwareAttention initialized: dim={dim}, num_heads={num_heads}, head_dim={head_dim}"
+        # )
 
     def forward(self, u_c, memory, theta):
         """
@@ -192,10 +223,10 @@ class RayAdapter(nn.Module):
             dim=adapter_dim, num_heads=num_heads, head_dim=head_dim
         )
 
-        print(
-            f"RayAdapter initialized: embed_dim={embed_dim}, adapter_dim={adapter_dim}"
-        )
-        print(f"  P_down/P_up use NORMAL initialization (NOT zero)")
+        # print(
+        #     f"RayAdapter initialized: embed_dim={embed_dim}, adapter_dim={adapter_dim}"
+        # )
+        # print(f"  P_down/P_up use NORMAL initialization (NOT zero)")
 
     def forward(self, u, memory, theta):
         """
@@ -246,18 +277,17 @@ class RayAdapter(nn.Module):
 
 
 if __name__ == "__main__":
-    print("Testing PerBlockGate...")
-    gate = PerBlockGate()
-    gate.verify_zero_init()
+    print("Testing PerBlockGate (Option B)...")
+    gate = PerBlockGate(gate_max=0.1, gate_init=0.03, gate_temperature=1.0)
 
     c_t = torch.randn(2, 64)
     gate_val = gate(c_t)
     print(f"  Input: {c_t.shape}, Output: {gate_val.shape}")
     assert gate_val.shape == (2, 1, 1)
-    assert torch.allclose(gate_val, torch.zeros_like(gate_val)), (
-        "Gate should output 0 at initialization"
-    )
-    print(f"  Gate output at init (should be 0): {gate_val.abs().max().item():.6f}")
+    assert gate_val.min().item() > 0, "Gate should be > 0 (sigmoid bounded)"
+    assert gate_val.max().item() < 0.1, "Gate should be < gate_max=0.1"
+    print(f"  Gate output at init (should be ~0.03): {gate_val.mean().item():.4f}")
+    print(f"  Gate range: [{gate_val.min().item():.4f}, {gate_val.max().item():.4f}]")
 
     print("\nTesting CameraAwareAttention...")
     sa_cam = CameraAwareAttention()

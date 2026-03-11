@@ -244,6 +244,12 @@ def build_vae_var_with_ray_adaptation(
     adapter_dim=128,
     num_memory_tokens=32,
     ray_adapter_num_heads=4,
+    ray_adapter_head_dim=32,
+    adapter_active_scale_indices=None,  # List of scale indices [0-9] where adapter is active
+    gate_floor=0.0,
+    gate_max=0.1,
+    gate_init=0.03,
+    gate_temperature=1.0,
 ) -> Tuple[VQVAE, ModifiedVAR]:
     heads = depth
     width = depth * 64
@@ -261,6 +267,12 @@ def build_vae_var_with_ray_adaptation(
         nn.ConvTranspose2d,
     ):
         setattr(clz, "reset_parameters", lambda self: None)
+
+    # Validate ray adapter head configuration
+    assert ray_adapter_num_heads * ray_adapter_head_dim == adapter_dim, (
+        f"Invalid ray adapter head config: num_heads ({ray_adapter_num_heads}) * "
+        f"head_dim ({ray_adapter_head_dim}) must equal adapter_dim ({adapter_dim})"
+    )
 
     # Build VAE (same as original)
     vae_local = VQVAE(
@@ -305,6 +317,12 @@ def build_vae_var_with_ray_adaptation(
         adapter_dim=adapter_dim,
         num_memory_tokens=num_memory_tokens,
         ray_adapter_num_heads=ray_adapter_num_heads,
+        ray_adapter_head_dim=ray_adapter_head_dim,
+        adapter_active_scale_indices=adapter_active_scale_indices,
+        gate_floor=gate_floor,
+        gate_max=gate_max,
+        gate_init=gate_init,
+        gate_temperature=gate_temperature,
     ).to(device)
 
     # Initialize weights for non-ray-adaptation parameters

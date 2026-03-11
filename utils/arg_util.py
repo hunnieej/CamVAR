@@ -21,6 +21,10 @@ class Args:
         for key, value in config.items():
             setattr(self, key, value)
 
+        # Unified adapter metrics logging interval (iterations); default off
+        if not hasattr(self, "adapter_metrics_every"):
+            self.adapter_metrics_every = 0
+
         # 额外的依赖项
         self.vae_ckpt = os.path.join(self.ckpt_path, "vae_ch160v4096z32.pth")
         self.var_ckpt = os.path.join(self.ckpt_path, f"var_d{self.depth}.pth")

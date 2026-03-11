@@ -9,6 +9,7 @@ from functools import partial
 import math
 import numpy as np
 import multiprocessing
+import datetime
 
 # Fix CUDA multiprocessing issue - must be set before CUDA initialization
 try:
@@ -225,10 +226,10 @@ def save_training_batch_images(inp_B3HW, obj, ep, it, g_it, save_dir):
     PImage.fromarray(grid_np).save(os.path.join(batch_dir, filename))
 
     # Include world size info in log message for multi-GPU
-    gpu_info = ""
-    if dist.initialized() and dist.get_world_size() > 1:
-        gpu_info = f" [gathered from {dist.get_world_size()} GPUs]"
-    print(f"     [train_batch_vis] Saved {filename} ({B} images{gpu_info})")
+    # gpu_info = ""
+    # if dist.initialized() and dist.get_world_size() > 1:
+    #     gpu_info = f" [gathered from {dist.get_world_size()} GPUs]"
+    # print(f"     [train_batch_vis] Saved {filename} ({B} images{gpu_info})")
 
 
 def build_everything(args: arg_util.Args):
@@ -279,7 +280,7 @@ def build_everything(args: arg_util.Args):
 
     # log args
     print(f"global bs={args.glb_batch_size}, local bs={args.batch_size}")
-    print(f"initial args:\n{str(args)}")
+    # print(f"initial args:\n{str(args)}")
 
     # build data
     if not args.local_debug:
@@ -388,8 +389,6 @@ def build_everything(args: arg_util.Args):
             )
             del dataset_train
 
-        num_classes = 1000
-
         [print(line) for line in auto_resume_info]
         print(f"[dataloader multi processing] ...", end="", flush=True)
         try:
@@ -408,14 +407,13 @@ def build_everything(args: arg_util.Args):
                 flush=True,
                 clean=True,
             )
-            print(
-                f"[dataloader] gbs={args.glb_batch_size}, lbs={args.batch_size}, iters_train={iters_train}, types(tr, va)={types}"
-            )
+            # print(
+            #     f"[dataloader] gbs={args.glb_batch_size}, lbs={args.batch_size}, iters_train={iters_train}, types(tr, va)={types}"
+            # )
         except:
             print(sys.exc_info())
 
     else:
-        num_classes = 1000
         ld_val = ld_train = None
         iters_train = 10
 
@@ -440,13 +438,31 @@ def build_everything(args: arg_util.Args):
         adapter_dim = getattr(args, "adapter_dim", 128)
         num_memory_tokens = getattr(args, "num_memory_tokens", 32)
         ray_adapter_num_heads = getattr(args, "ray_adapter_num_heads", 4)
+        ray_adapter_head_dim = getattr(args, "ray_adapter_head_dim", 32)
+        adapter_active_scale_indices = getattr(
+            args, "adapter_active_scale_indices", None
+        )
+        gate_floor = getattr(args, "gate_floor", 0.0)
+        gate_max = getattr(args, "gate_max", 0.1)
+        gate_init = getattr(args, "gate_init", 0.03)
+        gate_temperature = getattr(args, "gate_temperature", 1.0)
 
         print(
             f"[RAY ADAPTATION] patch_nums: {ray_patch_nums} (L={sum(pn**2 for pn in ray_patch_nums)})"
         )
-        print(f"[RAY ADAPTATION] adapter_dim: {adapter_dim}")
-        print(f"[RAY ADAPTATION] num_memory_tokens: {num_memory_tokens}")
-        print(f"[RAY ADAPTATION] ray_adapter_num_heads: {ray_adapter_num_heads}\n")
+        # print(f"[RAY ADAPTATION] adapter_dim: {adapter_dim}")
+        # print(f"[RAY ADAPTATION] num_memory_tokens: {num_memory_tokens}")
+        # print(f"[RAY ADAPTATION] ray_adapter_num_heads: {ray_adapter_num_heads}")
+        # print(f"[RAY ADAPTATION] ray_adapter_head_dim: {ray_adapter_head_dim}")
+        print(
+            f"[RAY ADAPTATION] adapter_active_scale_indices: {adapter_active_scale_indices}"
+        )
+        print(
+            f"[RAY ADAPTATION] gate_floor: {gate_floor} (deprecated; Option B gate used)"
+        )
+        print(
+            f"[RAY ADAPTATION] gate_max={gate_max}, gate_init={gate_init}, gate_temperature={gate_temperature}\n"
+        )
 
         vae_local, var_wo_ddp = build_vae_var_with_ray_adaptation(
             V=4096,
@@ -479,6 +495,12 @@ def build_everything(args: arg_util.Args):
             adapter_dim=adapter_dim,
             num_memory_tokens=num_memory_tokens,
             ray_adapter_num_heads=ray_adapter_num_heads,
+            ray_adapter_head_dim=ray_adapter_head_dim,
+            adapter_active_scale_indices=adapter_active_scale_indices,
+            gate_floor=gate_floor,
+            gate_max=gate_max,
+            gate_init=gate_init,
+            gate_temperature=gate_temperature,
         )
     else:
         vae_local, var_wo_ddp = build_vae_var(
@@ -514,13 +536,13 @@ def build_everything(args: arg_util.Args):
     vae_local.load_state_dict(
         torch.load(args.vae_ckpt, map_location="cpu"), strict=True
     )
-    if trainer_state is not None and len(trainer_state):
-        print("unsing strict=False in loading...")
-        new_state_dict = apply_lvl_emb_and_pos_1LC(
-            args, state_dict=trainer_state["var_wo_ddp"], patch_nums=args.patch_nums
-        )
-        missing, unexpected = var_wo_ddp.load_state_dict(new_state_dict, strict=False)
-        print("checkpoints incompatible: ", missing, unexpected)
+    # if trainer_state is not None and len(trainer_state):
+    #     print("unsing strict=False in loading...")
+    #     new_state_dict = apply_lvl_emb_and_pos_1LC(
+    #         args, state_dict=trainer_state["var_wo_ddp"], patch_nums=args.patch_nums
+    #     )
+    #     missing, unexpected = var_wo_ddp.load_state_dict(new_state_dict, strict=False)
+    #     print("checkpoints incompatible: ", missing, unexpected)
 
     if not args.from_scratch:
         zero_out_cross_attention_weights(var_wo_ddp)
@@ -542,7 +564,7 @@ def build_everything(args: arg_util.Args):
     # var: FSDP = (FSDP if dist.initialized() else NullDDP)(var_wo_ddp, device_id=dist.get_local_rank(),
     #                                                       sharding_strategy=ShardingStrategy.FULL_SHARD)
 
-    print(f"[INIT] VAR model = {var_wo_ddp}\n\n")
+    # print(f"[INIT] VAR model = {var_wo_ddp}\n\n")
     count_p = lambda m: f"{sum(p.numel() for p in m.parameters()) / 1e6:.2f}"
     print(
         f"[INIT][#para] "
@@ -613,10 +635,15 @@ def build_everything(args: arg_util.Args):
         var_opt=var_optim,
         label_smooth=args.ls,
     )
-    # if trainer_state is not None and len(trainer_state):
-    #     print('unsing strict=False in loading...')
-    #     missing,unexpected=trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
-    #     print('checkpoints incompatible: ',missing,unexpected)
+    trainer.adapter_metrics_every = getattr(args, "adapter_metrics_every", 0)
+    if trainer_state is not None and len(trainer_state):
+        missing, unexpected = trainer.load_state_dict(
+            trainer_state, strict=False, skip_vae=True
+        )  # don't load vae again
+        print(
+            f"[Checkpoint partial load] missing={len(missing)}, unexpected={len(unexpected)}"
+        )
+        # print('Checkpoints Weights Lists: ',missing,unexpected)
 
     del vae_local, var_wo_ddp, var, var_optim
 
@@ -644,6 +671,7 @@ def build_everything(args: arg_util.Args):
             prompt_embeds=prompt_embeds_,
             prog_si=-1,
             prog_wp_it=20,
+            args=args,
         )
         trainer.train_step(
             it=99,
@@ -656,6 +684,7 @@ def build_everything(args: arg_util.Args):
             prompt_embeds=prompt_embeds_,
             prog_si=-1,
             prog_wp_it=20,
+            args=args,
         )
         print({k: meter.global_avg for k, meter in me.meters.items()})
 
@@ -668,12 +697,12 @@ def build_everything(args: arg_util.Args):
             sys.stdout.close(), sys.stderr.close()
         exit(0)
 
-    for name, param in text_encoder.named_parameters():
-        print(f"Parameter: {name}, Requires Grad: {param.requires_grad}")
-    for name, param in trainer.vae_local.named_parameters():
-        print(f"Parameter: {name}, Requires Grad: {param.requires_grad}")
-    for name, param in trainer.var_wo_ddp.named_parameters():
-        print(f"Parameter: {name}, Requires Grad: {param.requires_grad}")
+    # for name, param in text_encoder.named_parameters():
+    #     print(f"Parameter: {name}, Requires Grad: {param.requires_grad}")
+    # for name, param in trainer.vae_local.named_parameters():
+    #     print(f"Parameter: {name}, Requires Grad: {param.requires_grad}")
+    # for name, param in trainer.var_wo_ddp.named_parameters():
+    #     print(f"Parameter: {name}, Requires Grad: {param.requires_grad}")
 
     dist.barrier()
     return (
@@ -726,27 +755,22 @@ def main_training():
     ckpt_save_it = getattr(args, "ckpt_save_it", 150000)
     print(f"[CHECKPOINT SAVING] Saving checkpoints every {ckpt_save_it} iterations")
 
-    print(f"===========> main training start")
     for ep in range(start_ep, args.ep):
         if hasattr(ld_train, "sampler") and hasattr(ld_train.sampler, "set_epoch"):
-            print(f"has attr sampler")
             ld_train.sampler.set_epoch(ep)
-            if ep < 3:
-                print(f"ep < 3")
-                # noinspection PyArgumentList
-                print(
-                    f"[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]",
-                    flush=True,
-                    force=True,
-                )
-        print(f"===========> in main training")
         tb_lg.set_step(ep * iters_train)
-        print(f"===========> epoch:{ep}, before eval")
         if ep > 0:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = (
                 trainer.eval_ep(args, ld_val, text_encoder)
             )
-        print(f"===========> epoch:{ep}, after eval")
+        if dist.is_local_master():
+            cur_start_it = start_it if ep == start_ep else 0
+            print(
+                f"[Epoch {ep + 1}/{args.ep}] training started "
+                f"(start_it={cur_start_it}, total_iters={iters_train})",
+                flush=True,
+            )
+
         # def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer):
         stats, (sec, remain_time, finish_time) = train_one_ep(
             ep=ep,
@@ -850,7 +874,7 @@ def main_training():
                 )
                 shutil.copy(local_out_ckpt, local_out_ckpt_best)
                 print(
-                    f"     [✅ NEW BEST] Saved best checkpoint @ {local_out_ckpt_best} (val_loss_tail={val_loss_tail:.4f})"
+                    f"     [✅ NEW BEST] Saved best checkpoint @ {local_out_ckpt_best} (val_loss_tail={val_loss_tail:.8f})"
                 )
 
             # Early stopping check
@@ -858,7 +882,7 @@ def main_training():
                 best_val_loss_for_early_stop = val_loss_tail
                 early_stop_counter = 0
                 print(
-                    f"     [✅ IMPROVEMENT] Validation loss improved: {val_loss_tail:.4f}"
+                    f"     [✅ IMPROVEMENT] Validation loss improved: {val_loss_tail:.8f}"
                 )
             else:
                 early_stop_counter += 1
@@ -961,7 +985,6 @@ def train_one_ep(
 ):
     # import heavy packages after Dataloader object creation
     # ld_or_itrt:dataloader
-    print(f"===========> epoch:{ep}, train_one_ep")
     from trainer import VARTrainer
     from utils.lr_control import lr_wd_annealing
 
@@ -971,8 +994,6 @@ def train_one_ep(
     me = misc.MetricLogger(delimiter="  ")
     me.add_meter("tlr", misc.SmoothedValue(window_size=1, fmt="{value:.2g}"))
     me.add_meter("tnm", misc.SmoothedValue(window_size=1, fmt="{value:.2f}"))
-    # if args.using_webtar:
-    #     me.add_meter('data_cnt', misc.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     [
         me.add_meter(x, misc.SmoothedValue(fmt="{median:.3f} ({global_avg:.3f})"))
         for x in ["Lm", "Lt"]
@@ -990,13 +1011,24 @@ def train_one_ep(
 
     if args.using_webtar:
         all_file_keys = []
-    for it, obj in me.log_every(
-        start_it=start_it,
-        max_iters=iters_train,
-        itrt=ld_or_itrt,
-        print_freq=math.floor(iters_train / args.print_every),
-        header=header,
-    ):
+
+    # Setup timing trackers
+    start_time = time.time()
+    iter_end_t = time.time()
+    iter_time = misc.SmoothedValue(fmt="{avg:.4f}")
+    data_time = misc.SmoothedValue(fmt="{avg:.4f}")
+    log_every_it = getattr(args, "log_every_it", 100)  # M iteration마다 출력
+
+    # Iterate through dataloader
+    for it, obj in enumerate(ld_or_itrt):
+        data_time.update(time.time() - iter_end_t)
+
+        if it < start_it:
+            continue
+
+        if is_first_ep and it == start_it:
+            warnings.resetwarnings()
+
         # Compute global iteration for checkpoint saving
         g_it = ep * iters_train + it
 
@@ -1006,7 +1038,6 @@ def train_one_ep(
                 local_out_ckpt = os.path.join(
                     args.local_out_dir_path, f"ar-ckpt-iter{g_it}.pth"
                 )
-                print(f"[saving ckpt @ {g_it} iters] ...", end="", flush=True)
                 torch.save(
                     {
                         "epoch": ep,
@@ -1030,9 +1061,6 @@ def train_one_ep(
                 if len(all_ckpts) > 3:
                     for old_ckpt in all_ckpts[:-3]:
                         os.remove(old_ckpt)
-                        print(
-                            f"     [cleanup] Removed old checkpoint: {os.path.basename(old_ckpt)}"
-                        )
 
                 trainer.inference_pic(
                     args,
@@ -1045,25 +1073,7 @@ def train_one_ep(
                     tb_lg=tb_lg,
                 )
                 torch.cuda.empty_cache()
-                print(
-                    f"     [saving ckpt](*) finished!  @ {local_out_ckpt}",
-                    flush=True,
-                    clean=True,
-                )
 
-        if it < start_it:
-            continue
-        if is_first_ep and it == start_it:
-            warnings.resetwarnings()
-
-        # (inp, label)
-        # if args.using_webtar:
-        #     file_keys=obj['file_key']
-        #     all_file_keys.extend(gather_file_keys(file_keys))
-        #     # print('rank=',dist.get_rank(),file_keys)
-        #     if dist.get_rank()==0:
-        #         # print('total=', len(set(all_file_keys)),' file_keys')
-        #         me.update(data_cnt=len(set(all_file_keys)))
         inp = obj["image"].to(args.device, non_blocking=True)
         obj["prompt_embeds"] = text_enc.extract_text_features(obj["prompt"])
         B = inp.shape[0]
@@ -1145,7 +1155,7 @@ def train_one_ep(
 
         # Save 3 training batch visualizations per epoch (evenly spaced)
         # All ranks must participate to avoid deadlock in collective operations
-        n_batch_saves = 3
+        n_batch_saves = 5
         batch_save_interval = max(1, iters_train // n_batch_saves)
         if it % batch_save_interval == 0 and it // batch_save_interval < n_batch_saves:
             save_training_batch_images(inp, obj, ep, it, g_it, args.local_out_dir_path)
@@ -1201,6 +1211,7 @@ def train_one_ep(
             prog_si=prog_si,
             prog_wp_it=args.pgwp * iters_train,
             cam_dir=cam_dir,
+            args=args,
             fov_deg=fov_deg,
         )
 
@@ -1215,14 +1226,71 @@ def train_one_ep(
         if args.tclip > 0:
             tb_lg.update(head="AR_opt_grad/grad", grad_norm=grad_norm)
             tb_lg.update(head="AR_opt_grad/grad", grad_clip=args.tclip)
-            # t_ratio = 1 if grad_norm is None else min(1.0, args.tclip / (grad_norm + 1e-7))
-            # tb_lg.update(head='AR_opt_lr/lr_max', actu_tlr=t_ratio*max_tlr)
-            # tb_lg.update(head='AR_opt_lr/lr_min', actu_tlr=t_ratio*min_tlr)
+
+        # Update iteration timing
+        iter_time.update(time.time() - iter_end_t)
+        iter_end_t = time.time()
+
+        # Print training progress every M iterations (rank 0 only)
+        if dist.is_local_master() and (
+            ((it + 1) % log_every_it == 0) or ((it + 1) == iters_train)
+        ):
+            avg_it_sec = iter_time.avg if iter_time.count > 0 else 0.0
+
+            # remaining iterations
+            remain_it_ep = iters_train - (it + 1)
+            remain_it_total = (args.ep - ep - 1) * iters_train + remain_it_ep
+
+            # ETA
+            eta_ep_sec = remain_it_ep * avg_it_sec
+            eta_total_sec = remain_it_total * avg_it_sec
+
+            eta_ep_str = str(datetime.timedelta(seconds=int(eta_ep_sec)))
+            eta_total_str = str(datetime.timedelta(seconds=int(eta_total_sec)))
+            finish_time_str = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(time.time() + eta_total_sec)
+            )
+
+            print(
+                f"{header} "
+                f"it {it + 1}/{iters_train} | "
+                f"Lm {me.meters['Lm'].median:.3f} | "
+                f"Lt {me.meters['Lt'].median:.3f} | "
+                f"Accm {me.meters['Accm'].median:.2f} | "
+                f"Acct {me.meters['Acct'].median:.2f} | "
+                f"lr {max_tlr:.2e} | "
+                f"{iter_time.avg:.3f}s/it | "
+                f"data {data_time.avg:.3f}s | "
+                f"ETA(ep) {eta_ep_str} | "
+                f"ETA(total) {eta_total_str} | "
+                f"finish {finish_time_str}",
+                flush=True,
+            )
+
+        # Break if we've completed all iterations
+        if it + 1 >= iters_train:
+            break
+
+    # Print epoch summary (only on rank 0)
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
 
     me.synchronize_between_processes()
+
+    if dist.is_local_master():
+        print(
+            f"{header} Completed - "
+            f"Lm: {me.meters['Lm'].global_avg:.3f}, "
+            f"Lt: {me.meters['Lt'].global_avg:.3f}, "
+            f"Accm: {me.meters['Accm'].global_avg:.2f}, "
+            f"Acct: {me.meters['Acct'].global_avg:.2f}, "
+            f"Time: {total_time_str} ({total_time / iters_train:.3f} s/it)",
+            flush=True,
+        )
+
     return {
         k: meter.global_avg for k, meter in me.meters.items()
-    }, me.iter_time.time_preds(
+    }, iter_time.time_preds(
         max_it - (g_it + 1) + (args.ep - ep) * 15
     )  # +15: other cost
 
