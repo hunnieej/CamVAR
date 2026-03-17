@@ -232,6 +232,51 @@ class DistSceneViewBatchSampler(Sampler):
         )
 
 
+class CubemapSceneSampler(Sampler):
+    """
+    Sampler for cubemap training.  Each iteration yields the dataset index
+    of ONE complete scene (all 6 faces are stored inside that single item).
+
+    The training loop then explodes the scene into set1 and set2 in-place —
+    this sampler does NOT split faces; it just selects which scene to use.
+
+    Args:
+        num_scenes: Total number of valid scenes in the dataset.
+        shuffle: Whether to randomize scene selection order.
+        seed: RNG seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        num_scenes: int,
+        shuffle: bool = True,
+        seed: int = 0,
+    ):
+        assert num_scenes > 0, "num_scenes must be positive"
+        self.num_scenes = num_scenes
+        self.shuffle = shuffle
+        self.rng = torch.Generator()
+        self.rng.manual_seed(seed)
+
+    def __iter__(self):
+        while True:
+            if self.shuffle:
+                scene_idx = torch.randint(
+                    low=0,
+                    high=self.num_scenes,
+                    size=(1,),
+                    generator=self.rng,
+                ).item()
+            else:
+                scene_idx = 0
+            # Yield a single-element list so DataLoader batch_sampler interface
+            # is satisfied: each call returns one item → batch_size=1 effectively.
+            yield [scene_idx]
+
+    def __len__(self) -> int:
+        return self.num_scenes
+
+
 class DistInfiniteBatchSampler(InfiniteBatchSampler):
     def __init__(
         self,

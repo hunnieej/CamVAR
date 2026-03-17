@@ -70,6 +70,46 @@ class Args:
         if not hasattr(self, "erp_grouping_mode"):
             self.erp_grouping_mode = "spread"
 
+        # ── Cubemap training configuration ───────────────────────────────────
+        # Path to root dir containing train/ and val/ scene subdirectories
+        # (kept for backward compat with CubemapSceneDataset)
+        if not hasattr(self, "cubemap_dataset_path"):
+            self.cubemap_dataset_path = "dataset/cubemap"
+        # JSONL paths for on-the-fly ERP→cubemap projection (ERPToCubemapDataset).
+        # Falls back to erp_jsonl_paths if not explicitly set.
+        if not hasattr(self, "cubemap_erp_jsonl_paths"):
+            self.cubemap_erp_jsonl_paths = getattr(
+                self,
+                "erp_jsonl_paths",
+                ["dataset/ERP/matterport.jsonl", "dataset/ERP/polyhaven.jsonl"],
+            )
+        # Separate val JSONL paths; falls back to train paths
+        if not hasattr(self, "cubemap_erp_jsonl_paths_val"):
+            self.cubemap_erp_jsonl_paths_val = self.cubemap_erp_jsonl_paths
+        # FOV per cubemap face in degrees (90° = exact cube face)
+        if not hasattr(self, "cubemap_fov_deg"):
+            self.cubemap_fov_deg = 90.0
+        # Optional cap on panoramas used for cubemap training
+        if not hasattr(self, "cubemap_max_panos"):
+            self.cubemap_max_panos = None
+        if not hasattr(self, "cubemap_subset_seed"):
+            self.cubemap_subset_seed = None
+        # Conditioning mode: "face_id" (discrete) or "face_id+cam_dir" (combined)
+        if not hasattr(self, "cubemap_conditioning_mode"):
+            self.cubemap_conditioning_mode = "face_id"
+        # Whether to reconstruct an ERP preview from the 6 generated faces
+        if not hasattr(self, "cubemap_erp_reconstruction"):
+            self.cubemap_erp_reconstruction = True
+        # Anchor-weighted mode: front/back appear in both set1 and set2 (NOT a bug)
+        if not hasattr(self, "cubemap_anchor_weighted"):
+            self.cubemap_anchor_weighted = True
+        # Print extra debug messages in cubemap training path
+        if not hasattr(self, "cubemap_debug"):
+            self.cubemap_debug = False
+        # face_id embedding dimension (should match cam_dir feature dim in adapter)
+        if not hasattr(self, "cubemap_face_id_embed_dim"):
+            self.cubemap_face_id_embed_dim = 3
+
         # 额外的依赖项
         self.vae_ckpt = os.path.join(self.ckpt_path, "vae_ch160v4096z32.pth")
         self.var_ckpt = os.path.join(self.ckpt_path, f"var_d{self.depth}.pth")

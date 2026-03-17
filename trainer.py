@@ -202,6 +202,134 @@ class VARTrainer(object):
             base_save_dir = osp.join(args.local_out_dir_path, "val_imgs", f"git{g_it}")
             os.makedirs(base_save_dir, exist_ok=True)
 
+            # ── Cubemap inference path: generate exactly 6 faces (no ERP trajectory) ──
+            if getattr(args, "dataset_type", "erp") == "cubemap":
+                from utils.cubemap_groups import CANONICAL_FACES, FACE_TO_IDX
+                from utils.face_id_embedding import FaceIdEmbedding
+                import torch.nn.functional as F
+
+                face_embed_dim = getattr(args, "cubemap_face_id_embed_dim", 3)
+                face_id_embed = FaceIdEmbedding(embed_dim=face_embed_dim).to(
+                    args.device
+                )
+                face_id_embed.eval()
+
+                for scale_set in scale_sets:
+                    scale_label = _fmt_scale(scale_set)
+                    active_scales = (
+                        scale_set
+                        if scale_set is not None
+                        else getattr(
+                            self.var_wo_ddp, "adapter_active_scale_indices", None
+                        )
+                    )
+
+                    for sampling_cfg in sampling_cfgs:
+                        cfg_val = sampling_cfg.get("cfg", args.cfg)
+                        top_k_val = sampling_cfg.get("top_k", top_k)
+                        top_p_val = sampling_cfg.get("top_p", top_p)
+                        sampling_label = _fmt_sampling(sampling_cfg)
+
+                        save_path = osp.join(
+                            base_save_dir,
+                            f"scale-{scale_label}",
+                            f"decode-{sampling_label}",
+                        )
+                        os.makedirs(save_path, exist_ok=True)
+
+                        for i in range(
+                            ceil(len(args.instance_prompt) / args.infer_bsz)
+                        ):
+                            prompt_cur = args.instance_prompt[
+                                i * args.infer_bsz : min(
+                                    (i + 1) * args.infer_bsz, len(args.instance_prompt)
+                                )
+                            ]
+                            B_ = len(prompt_cur)
+                            prompt_cur_with_uncond = prompt_cur + [""] * B_
+
+                            label = torch.zeros(B_, dtype=torch.long).to(
+                                args.device, non_blocking=True
+                            )
+
+                            with torch.inference_mode():
+                                prompt_embeds, prompt_attention_mask, pooled_embed = (
+                                    text_enc.extract_text_features(
+                                        prompt_cur_with_uncond
+                                    )
+                                )
+
+                            for face_name in CANONICAL_FACES:
+                                face_idx = FACE_TO_IDX[face_name]
+                                face_id_tensor = torch.tensor(
+                                    [face_idx], device=args.device, dtype=torch.long
+                                )
+                                cam_dir = face_id_embed(face_id_tensor)  # [1, D]
+                                cam_dir = F.normalize(cam_dir, dim=-1, eps=1e-6)
+                                cam_dir = cam_dir.expand(B_, -1)  # [B_, D]
+                                view_idx_tensor = torch.full(
+                                    (B_,),
+                                    face_idx,
+                                    device=args.device,
+                                    dtype=torch.long,
+                                )
+
+                                with torch.inference_mode():
+                                    result = self.var_wo_ddp.autoregressive_infer_cfg(
+                                        B=B_,
+                                        label_B=label,
+                                        encoder_hidden_states=prompt_embeds,
+                                        encoder_attention_mask=prompt_attention_mask,
+                                        encoder_pool_feat=pooled_embed,
+                                        cfg=cfg_val,
+                                        top_k=top_k_val,
+                                        top_p=top_p_val,
+                                        g_seed=seed + face_idx,
+                                        w_mask=w_mask,
+                                        view_idx=view_idx_tensor,
+                                        cam_dir=cam_dir,
+                                        fov_deg=getattr(args, "fov_deg", 90.0),
+                                        patch_size=getattr(args, "patch_size", 16),
+                                        collect_metrics=args.adapter_metrics_every > 0,
+                                        adapter_active_scale_indices_override=active_scales,
+                                    )
+
+                                    if isinstance(result, tuple):
+                                        recon_B3HW, inf_metrics = result
+                                        if (
+                                            tb_lg is not None
+                                            and inf_metrics is not None
+                                        ):
+                                            tb_lg.update(
+                                                head=(
+                                                    f"inference_ray_metrics/scale-{scale_label}/"
+                                                    f"decode-{sampling_label}/face-{face_name}"
+                                                ),
+                                                **inf_metrics,
+                                                step=g_it,
+                                            )
+                                    else:
+                                        recon_B3HW = result
+
+                                # Save outputs: one file per face per prompt
+                                if osp.exists(save_path):
+                                    for j, label_text in enumerate(prompt_cur):
+                                        chw = (
+                                            (
+                                                recon_B3HW[j].permute(1, 2, 0).cpu()
+                                                * 255.0
+                                            )
+                                            .numpy()
+                                            .astype(np.uint8)
+                                        )
+                                        filename = f"{format_sentence(label_text)}_{face_name}.png"
+                                        PImage.fromarray(chw).save(
+                                            osp.join(save_path, filename)
+                                        )
+
+                # Cubemap path is self-contained; skip ERP trajectory block
+                return
+
             # Get camera parameters from args
             fov_deg = getattr(args, "fov_deg", 120.0)
             patch_size = getattr(args, "patch_size", 16)

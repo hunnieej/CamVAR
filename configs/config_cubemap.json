@@ -1,30 +1,41 @@
 {
-  "_comment": "View : 4 / FoV = 90 / 2500 erp images",
-  
-  "exp_name": "phase_c_ray_adaptation",
-  "wandb_project": "STAR-T2I-RayAdaptation",
-  "wandb_run_name": "phase_c_0317_1",
+  "_comment": "Cubemap anchor-weighted training — 1 GPU. Modeled on config_phase_c.json.",
+
+  "exp_name": "cubemap_anchor_1gpu",
+  "wandb_project": "STAR-T2I-CubemapTraining",
+  "wandb_run_name": "cubemap_anchor_1gpu",
   "wandb_mode": "online",
-  "dataset_type": "erp",
-  "erp_jsonl_paths": ["dataset/ERP/matterport.jsonl", "dataset/ERP/polyhaven.jsonl"],
-  "erp_jsonl_paths_val": ["dataset/ERP/matterport.jsonl"],
-  "erp_views_per_pano": 12,
-  "erp_fov_deg": 120.0,
-  "erp_same_scene_accum": true,
-  "erp_views_per_scene": 8,
-  "erp_group_size": 4,
-  "erp_grouping_mode": "spread",
-  "erp_view_groups": [[0,3,5,7],[1,2,4,6]],
-  "erp_max_panos": 3000,
-  "erp_subset_seed": 42,
-  "erp_loxodrome_params": {
-    "lat0": -35,
-    "lat1": 35,
-    "lon0": 0,
-    "bearing":15,
-    "spacing": "rhumb"
-  },
-  
+
+  "_comment_dataset": "=== CUBEMAP DATASET (on-the-fly ERP → 6 faces) ===",
+  "dataset_type": "cubemap",
+  "cubemap_erp_jsonl_paths": [
+    "dataset/ERP/matterport.jsonl",
+    "dataset/ERP/polyhaven.jsonl"
+  ],
+  "cubemap_erp_jsonl_paths_val": [
+    "dataset/ERP/matterport.jsonl"
+  ],
+  "cubemap_fov_deg": 90.0,
+
+  "_comment_grouping": "=== 2-SET ANCHOR-WEIGHTED GROUPING ===",
+  "_comment_set1": "set1 = [front, back, left, right] — horizontal belt",
+  "_comment_set2": "set2 = [front, back, up, down]   — vertical cross",
+  "_comment_anchor": "front and back appear in BOTH sets: intentional anchor weighting",
+  "cubemap_canonical_face_order": ["front", "right", "back", "left", "up", "down"],
+  "cubemap_set1_faces": ["front", "back", "left", "right"],
+  "cubemap_set2_faces": ["front", "back", "up", "down"],
+  "cubemap_anchor_weighted": true,
+  "cubemap_total_slots_per_update": 8,
+
+  "_comment_conditioning": "=== CUBEMAP CONDITIONING ===",
+  "cubemap_conditioning_mode": "face_id",
+  "cubemap_face_id_embed_dim": 3,
+
+  "_comment_output_flags": "=== OUTPUT FLAGS ===",
+  "cubemap_erp_reconstruction": true,
+  "cubemap_debug": false,
+
+  "_comment_training": "=== TRAINING CONFIGURATION (matches config_phase_c.json) ===",
   "depth": 30,
   "bs": 4,
   "batch_size": 0,
@@ -34,7 +45,8 @@
   "adapter_metrics_every": 100,
   "infer_bsz": 1,
   "ckpt_save_it": 500,
-  
+
+  "_comment_ray": "=== RAY ADAPTATION PARAMETERS (matches config_phase_c.json) ===",
   "enable_ray_adaptation": true,
   "ray_patch_nums": [1, 2, 3, 4, 6, 9, 13, 18, 24, 32],
   "adapter_dim": 128,
@@ -54,16 +66,18 @@
   "gate_temperature": 1.0,
   "disable_memory_kv": false,
   "theta_log_every": 100,
-  "fov_deg": 120.0,
+  "fov_deg": 90.0,
   "patch_size_ray": 16,
-  
+
+  "_comment_ckpt": "=== CHECKPOINT / OUTPUT PATHS ===",
   "ckpt_path": "ckpt",
   "pretrained_ckpt": "ckpt/star_rope_d30_512-ar-ckpt-ep1-iter30000.pth",
   "text_enc": "clip",
   "text_enc_path": "ckpt/CLIP",
-  "local_out_dir_path": "outputs/260317_at1",
+  "local_out_dir_path": "outputs/cubemap_anchor_1gpu",
   "instance_prompt": "dataset/prompts/val_scenes_c.txt",
-  
+
+  "_comment_arch": "=== MODEL / DATA ARCHITECTURE ===",
   "pn": "1_2_3_4_6_9_13_18_24_32",
   "patch_size": 16,
   "patch_nums": [1, 2, 3, 4, 6, 9, 13, 18, 24, 32],
@@ -72,7 +86,8 @@
   "classifier_free_training_prob": 0.1,
   "hflip": false,
   "workers": 0,
-  
+
+  "_comment_opt": "=== OPTIMIZER / LR SCHEDULE ===",
   "fp16": 1,
   "tlr": 1e-4,
   "tblr": 0.0001,
@@ -85,7 +100,8 @@
   "wpe": 0.01,
   "sche": "lin0",
   "opt": "adamw",
-  
+
+  "_comment_model": "=== MODEL FLAGS ===",
   "rope_emb": true,
   "lvl_emb": true,
   "rope_norm": 64,
@@ -97,14 +113,15 @@
   "from_scratch": false,
   "from_0": true,
   "using_webtar": false,
-  
+
+  "_comment_misc": "=== MISC ===",
   "tf32": true,
   "device": "cuda",
   "default_label": 1000,
   "seed": 42,
   "same_seed_for_all_ranks": 0,
   "cfg": 4.0,
-  
+
   "vfast": 0,
   "tfast": 0,
   "ini": -1,

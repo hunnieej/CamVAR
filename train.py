@@ -19,6 +19,7 @@ except RuntimeError:
     pass  # Already set
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 
@@ -379,6 +380,43 @@ def build_everything(args: arg_util.Args):
 
             del dataset_train, dataset_val
 
+        elif dataset_type == "cubemap":
+            print("[using Cubemap dataset for anchor-weighted training] ...\n")
+            from dataset.data import build_cubemap_dataset_v2
+            from utils.data_sampler import CubemapSceneSampler
+
+            dataset_train, dataset_val = build_cubemap_dataset_v2(args)
+            types = str((type(dataset_train).__name__, type(dataset_val).__name__))
+            # Each scene is one complete 6-face unit; sampler yields single scene indices
+            cubemap_sampler = CubemapSceneSampler(
+                num_scenes=len(dataset_train),
+                shuffle=True,
+                seed=args.seed
+                if hasattr(args, "seed") and args.seed is not None
+                else 0,
+            )
+            ld_train = DataLoader(
+                dataset=dataset_train,
+                num_workers=args.workers,
+                pin_memory=True,
+                generator=args.get_different_generator_for_each_rank(),
+                batch_sampler=cubemap_sampler,
+            )
+            ld_val = DataLoader(
+                dataset_val,
+                num_workers=0,
+                pin_memory=True,
+                batch_size=1,
+                sampler=EvalDistributedSampler(
+                    dataset_val,
+                    num_replicas=dist.get_world_size(),
+                    rank=dist.get_rank(),
+                ),
+                shuffle=False,
+                drop_last=False,
+            )
+            del dataset_train, dataset_val
+
         elif args.using_webtar:
             print("[using webtar] ...\n")
             dataset_train, dataset_val = build_dataset_webtar(args)
@@ -442,6 +480,9 @@ def build_everything(args: arg_util.Args):
         try:
             stt = time.time()
             if dataset_type == "erp":
+                iters_train = len(ld_train)
+                ld_train = iter(ld_train)
+            elif dataset_type == "cubemap":
                 iters_train = len(ld_train)
                 ld_train = iter(ld_train)
             elif args.using_webtar:
@@ -1094,8 +1135,11 @@ def train_one_ep(
     use_erp_accum = getattr(args, "dataset_type", "") == "erp" and getattr(
         args, "erp_same_scene_accum", False
     )
+    use_cubemap_accum = getattr(args, "dataset_type", "") == "cubemap"
     micro_per_update = (
-        max(
+        2  # cubemap always has exactly 2 groups (set1 + set2) per effective update
+        if use_cubemap_accum
+        else max(
             1,
             # Derive num_groups from the dynamic grouping parameters
             math.ceil(
@@ -1135,13 +1179,21 @@ def train_one_ep(
         # Compute global iteration for checkpoint saving
         g_it = ep * iters_train + it
 
-        inp = obj["image"].to(args.device, non_blocking=True)
-        obj["prompt_embeds"] = text_enc.extract_text_features(obj["prompt"])
-        B = inp.shape[0]
-        label = torch.tensor([args.default_label] * B).to(
-            args.device, non_blocking=True
-        )
-        prompt_embeds = obj["prompt_embeds"]
+        if use_cubemap_accum:
+            # Cubemap batches have "images" [1,6,C,H,W] — skip the shared extraction.
+            # The cubemap training branch (elif use_cubemap_accum) handles all of this.
+            inp = None
+            B = 1
+            label = None
+            prompt_embeds = None
+        else:
+            inp = obj["image"].to(args.device, non_blocking=True)
+            obj["prompt_embeds"] = text_enc.extract_text_features(obj["prompt"])
+            B = inp.shape[0]
+            label = torch.tensor([args.default_label] * B).to(
+                args.device, non_blocking=True
+            )
+            prompt_embeds = obj["prompt_embeds"]
 
         # Extract camera parameters if present (for ray adaptation training)
         cam_dir = None
@@ -1454,6 +1506,205 @@ def train_one_ep(
                 }
                 with open(os.path.join(update_dir, "meta.json"), "w") as f:
                     json.dump(meta, f, indent=2)
+
+            if stepping:
+                update_step += 1
+            step_cnt += int(stepping)
+
+        elif use_cubemap_accum:
+            # ── Cubemap anchor-weighted 2-set accumulation ──────────────────────
+            # Dataset yields: images[1,6,C,H,W], face_ids[1,6], prompt, scene_id
+            # set1 = [front, back, left, right]; set2 = [front, back, up, down]
+            # front + back appear in BOTH sets — INTENTIONAL anchor weighting, NOT a bug.
+            # Each effective optimizer update = 2 microbatches (set1 then set2).
+            from utils.cubemap_groups import (
+                CANONICAL_FACES as _CANONICAL_FACES,
+                CUBEMAP_SET1 as _CUBEMAP_SET1,
+                CUBEMAP_SET2 as _CUBEMAP_SET2,
+                FACE_TO_IDX as _FACE_TO_IDX,
+                DUPLICATION_SUMMARY as _DUPLICATION_SUMMARY,
+                make_cubemap_groups as _make_cubemap_groups,
+                validate_cubemap_groups as _validate_cubemap_groups,
+                cubemap_loss_divisors as _cubemap_loss_divisors,
+            )
+            from utils.face_id_embedding import FaceIdEmbedding as _FaceIdEmbedding
+
+            # Squeeze batch-dim (DataLoader wraps single-item batch_sampler output)
+            scene_images = obj["images"]  # [1, 6, C, H, W]
+            if scene_images.dim() == 5:
+                scene_images = scene_images.squeeze(0)  # [6, C, H, W]
+            scene_images = scene_images.to(args.device, non_blocking=True)
+
+            scene_face_ids = obj["face_ids"]  # [1, 6] or [6]
+            if isinstance(scene_face_ids, torch.Tensor) and scene_face_ids.dim() == 2:
+                scene_face_ids = scene_face_ids.squeeze(0)  # [6]
+
+            scene_id = (
+                obj["scene_id"][0]
+                if isinstance(obj["scene_id"], (list, tuple))
+                else obj["scene_id"]
+            )
+            scene_prompt = (
+                obj["prompt"][0]
+                if isinstance(obj["prompt"], (list, tuple))
+                else obj["prompt"]
+            )
+
+            # ── Assertions ──────────────────────────────────────────────────────
+            assert scene_images.shape[0] == 6, (
+                f"[cubemap accum] Expected 6 faces, got {scene_images.shape[0]}"
+            )
+            assert len(scene_face_ids) == 6, (
+                f"[cubemap accum] Expected 6 face_ids, got {len(scene_face_ids)}"
+            )
+
+            # Build groups and validate design invariants
+            _groups = _make_cubemap_groups()  # [set1_names, set2_names]
+            _validate_cubemap_groups(_groups)
+            _loss_divisors = _cubemap_loss_divisors()  # [2.0, 2.0]
+
+            # Verify front+back duplication (anchor weighting assertion)
+            for _anchor in ("front", "back"):
+                assert _anchor in _groups[0] and _anchor in _groups[1], (
+                    f"[cubemap accum] Anchor '{_anchor}' missing from a group — "
+                    "breaks intentional anchor weighting"
+                )
+
+            assert len(_groups) == 2, (
+                f"[cubemap accum] Expected exactly 2 groups, got {len(_groups)}"
+            )
+            assert [sorted(g) for g in _groups] == [
+                sorted(_CUBEMAP_SET1),
+                sorted(_CUBEMAP_SET2),
+            ], "[cubemap accum] Groups do not match CUBEMAP_SET1/SET2"
+
+            # Map face name → position index in scene_images (canonical order)
+            _face_name_to_pos = {name: i for i, name in enumerate(_CANONICAL_FACES)}
+
+            # Lazy-init FaceIdEmbedding (persisted on args to avoid re-creating)
+            if not hasattr(args, "_cubemap_face_id_embed"):
+                _embed_dim = getattr(args, "cubemap_face_id_embed_dim", 3)
+                args._cubemap_face_id_embed = _FaceIdEmbedding(embed_dim=_embed_dim).to(
+                    args.device
+                )
+
+            # Per-update visualization bookkeeping
+            n_batch_saves = 5
+            save_interval = max(1, updates_per_epoch // n_batch_saves)
+            is_first_update_this_ep = update_step == ep * updates_per_epoch
+            do_save = (update_step % save_interval == 0) or is_first_update_this_ep
+
+            update_dir = os.path.join(
+                args.local_out_dir_path,
+                "train_batch_vis",
+                f"update_{update_step:07d}",
+            )
+            if do_save and dist.is_master():
+                os.makedirs(update_dir, exist_ok=True)
+
+            base_stepping = True
+            stepping = False
+            grad_norm = scale_log2 = None
+            group_records = []
+
+            for _idx_i, (_group_names, _loss_divisor) in enumerate(
+                zip(_groups, _loss_divisors)
+            ):
+                _pos_indices = [_face_name_to_pos[n] for n in _group_names]
+                _pos_tensor = torch.tensor(_pos_indices, device=args.device)
+
+                inp_grp = scene_images[_pos_tensor]  # [4, C, H, W]
+                B_grp = inp_grp.shape[0]
+                label_grp = torch.tensor(
+                    [args.default_label] * B_grp, device=args.device
+                )
+
+                # Text embeddings for group
+                _group_prompts = [scene_prompt] * B_grp
+                prompt_embeds_grp = text_enc.extract_text_features(_group_prompts)
+
+                # face_id embeddings as conditioning signal (cam_dir slot)
+                _face_ids_grp = torch.tensor(
+                    [_FACE_TO_IDX[n] for n in _group_names],
+                    device=args.device,
+                    dtype=torch.long,
+                )
+                cam_dir_grp = args._cubemap_face_id_embed(
+                    _face_ids_grp
+                )  # [4, embed_dim]
+                # Ensure unit-norm camera directions for camera_system assertions
+                cam_dir_grp = F.normalize(cam_dir_grp, dim=-1, eps=1e-6)
+
+                if do_save and dist.is_master():
+                    _set_label = "set1" if _idx_i == 0 else "set2"
+                    _fname = f"{_set_label}_faces_{'_'.join(_group_names)}.png"
+                    save_training_batch_images(
+                        inp_grp,
+                        {
+                            "prompt": _group_prompts,
+                            "fov_deg": None,
+                            "cam_dir": None,
+                        },
+                        ep,
+                        it,
+                        update_step,
+                        args.local_out_dir_path,
+                        view_ids=_pos_indices,
+                        gather=False,
+                        update_dir=update_dir,
+                        filename=_fname,
+                    )
+                    group_records.append(
+                        {
+                            "set": _set_label,
+                            "face_names": list(_group_names),
+                            "face_positions": _pos_indices,
+                        }
+                    )
+
+                stepping = base_stepping and (_idx_i == len(_groups) - 1)
+                grad_norm, scale_log2 = trainer.train_step(
+                    it=it,
+                    g_it=update_step,
+                    stepping=stepping,
+                    metric_lg=me,
+                    tb_lg=tb_lg,
+                    inp_B3HW=inp_grp,
+                    label_B=label_grp,
+                    prompt_embeds=prompt_embeds_grp,
+                    prog_si=prog_si,
+                    prog_wp_it=args.pgwp * iters_train,
+                    cam_dir=cam_dir_grp,
+                    args=args,
+                    fov_deg=getattr(args, "fov_deg", 90.0),
+                    view_idx=_face_ids_grp,
+                    loss_divisor=_loss_divisor,
+                )
+
+            # Write meta.json after both groups processed (optimizer step)
+            if stepping and do_save and dist.is_master():
+                _ws = dist.get_world_size() if dist.initialized() else 1
+                _meta = {
+                    "mode": "cubemap",
+                    "optimizer_step": update_step,
+                    "microbatch": int(it),
+                    "scene_id": str(scene_id),
+                    "prompt": str(scene_prompt),
+                    "world_size": _ws,
+                    "canonical_face_order": list(_CANONICAL_FACES),
+                    "grouped_faces": {
+                        "set1": list(_CUBEMAP_SET1),
+                        "set2": list(_CUBEMAP_SET2),
+                    },
+                    "duplication_summary": _DUPLICATION_SUMMARY,
+                    "group_records": group_records,
+                    "note": (
+                        "front and back appear in set1 AND set2. "
+                        "This is intentional anchor weighting, NOT a bug."
+                    ),
+                }
+                with open(os.path.join(update_dir, "meta.json"), "w") as f:
+                    json.dump(_meta, f, indent=2)
 
             if stepping:
                 update_step += 1
