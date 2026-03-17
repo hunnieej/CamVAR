@@ -74,6 +74,8 @@ class VARTrainer(object):
         var: DDP,
         var_opt: AmpOptimizer,
         label_smooth: float,
+        tclip: float = 0.0,
+        views_per_pano: int = None,
     ):
         super(VARTrainer, self).__init__()
 
@@ -89,6 +91,13 @@ class VARTrainer(object):
         self.var_wo_ddp.rng = torch.Generator(device=device)
 
         self.label_smooth = label_smooth
+        self.tclip = tclip
+        self.views_per_pano = views_per_pano
+        self.view_hist = (
+            torch.zeros(views_per_pano, device=device, dtype=torch.long)
+            if views_per_pano is not None
+            else None
+        )
         self.train_loss = nn.CrossEntropyLoss(
             label_smoothing=label_smooth, reduction="none"
         )
@@ -115,161 +124,227 @@ class VARTrainer(object):
         self,
         args,
         text_enc,
-        cur_ep,
-        cur_iter,
+        g_it,
         top_k=600,
         top_p=0.8,
         w_mask=False,
         tb_lg=None,
+        adapter_scale_sets=None,
+        sampling_setups=None,
     ):
-        seed = 4  # @param {type:"number"}
-        # seed
+        # ── Fix 1: Save and restore all RNG states so inference does not
+        #    corrupt the global randomness used by the training loop. ─────────
+        rng_cpu_state = torch.get_rng_state()
+        rng_cuda_state = (
+            torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        )
+        rng_py_state = random.getstate()
+        rng_np_state = np.random.get_state()
+
+        seed = 4  # fixed seed for deterministic qualitative samples
         torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         random.seed(seed)
         np.random.seed(seed)
+
+        # ── Fix 5: Save each module's train/eval state and restore on exit. ──
+        var_was_training = self.var_wo_ddp.training
+        vae_was_training = self.vae_local.training
+        text_enc_was_training = text_enc.training
 
         self.var_wo_ddp.eval()
         self.vae_local.eval()
         text_enc.eval()
 
-        # Create save directory once
-        save_path = osp.join(
-            args.local_out_dir_path, "val_imgs", "ep%d_iter%d" % (cur_ep, cur_iter)
-        )
         try:
-            if not osp.exists(save_path):
-                os.makedirs(save_path)
-        except:
-            print("failed to makedir %s" % save_path)
+            # Stage 3 & 4: build sweeps for adapter scales and decoding configs
+            scale_sets = (
+                adapter_scale_sets
+                if adapter_scale_sets is not None
+                else getattr(args, "inference_scale_sets", None)
+            )
+            if scale_sets is None:
+                scale_sets = [None]  # default: use model's configured active scales
 
-        # Get camera parameters from args
-        fov_deg = getattr(args, "fov_deg", 120.0)
-        patch_size = getattr(args, "patch_size", 16)
-        views_per_pano = getattr(args, "erp_views_per_pano", 12)
+            sampling_cfgs = (
+                sampling_setups
+                if sampling_setups is not None
+                else getattr(args, "inference_sampling_setups", None)
+            )
+            if sampling_cfgs is None:
+                sampling_cfgs = [
+                    {
+                        "name": "default",
+                        "cfg": args.cfg,
+                        "top_k": top_k,
+                        "top_p": top_p,
+                    }
+                ]
 
-        # Get loxodrome parameters from args (same as training)
-        loxodrome_params = getattr(args, "erp_loxodrome_params", {})
-        lat0_deg = loxodrome_params.get("lat0", -55)
-        lat1_deg = loxodrome_params.get("lat1", 55)
-        lon0_deg = loxodrome_params.get("lon0", 0)
-        bearing_deg = loxodrome_params.get("bearing", 15)
-        spacing = loxodrome_params.get("spacing", "rhumb")
-        # print(fov_deg, lat0_deg, lat1_deg, lon0_deg, bearing_deg, spacing)
+            def _fmt_scale(s):
+                if s is None:
+                    return "default"
+                if len(s) == 0:
+                    return "none"
+                return "s" + "-".join(str(x) for x in s)
 
-        # Generate camera directions using same trajectory as training
-        camera_trajectory = generate_validation_camera_dirs(
-            views_per_pano=views_per_pano,
-            lat0_deg=lat0_deg,
-            lat1_deg=lat1_deg,
-            lon0_deg=lon0_deg,
-            bearing_deg=bearing_deg,
-            spacing=spacing,
-        )
+            def _fmt_sampling(s):
+                name = s.get("name") if isinstance(s, dict) else None
+                if name:
+                    return name
+                cfg_v = s.get("cfg", args.cfg) if isinstance(s, dict) else args.cfg
+                tk = s.get("top_k", top_k) if isinstance(s, dict) else top_k
+                tp = s.get("top_p", top_p) if isinstance(s, dict) else top_p
+                return f"cfg{cfg_v}_k{tk}_p{tp:.2f}"
 
-        for i in range(ceil(len(args.instance_prompt) / args.infer_bsz)):
-            prompt_cur = args.instance_prompt[
-                i * args.infer_bsz : min(
-                    (i + 1) * args.infer_bsz, len(args.instance_prompt)
-                )
-            ]
-            B_ = len(prompt_cur)
-            prompt_cur_with_uncond = prompt_cur + [""] * B_
-            label = torch.tensor([args.default_label] * B_).to(
-                args.device, non_blocking=True
+            # Base directory shared across sweeps
+            base_save_dir = osp.join(args.local_out_dir_path, "val_imgs", f"git{g_it}")
+            os.makedirs(base_save_dir, exist_ok=True)
+
+            # Get camera parameters from args
+            fov_deg = getattr(args, "fov_deg", 120.0)
+            patch_size = getattr(args, "patch_size", 16)
+            views_per_pano = getattr(args, "erp_views_per_pano", 12)
+
+            # Get loxodrome parameters from args (same as training)
+            loxodrome_params = getattr(args, "erp_loxodrome_params", {})
+            lat0_deg = loxodrome_params.get("lat0", -55)
+            lat1_deg = loxodrome_params.get("lat1", 55)
+            lon0_deg = loxodrome_params.get("lon0", 0)
+            bearing_deg = loxodrome_params.get("bearing", 15)
+            spacing = loxodrome_params.get("spacing", "rhumb")
+
+            # Generate camera directions using same trajectory as training
+            camera_trajectory = generate_validation_camera_dirs(
+                views_per_pano=views_per_pano,
+                lat0_deg=lat0_deg,
+                lat1_deg=lat1_deg,
+                lon0_deg=lon0_deg,
+                bearing_deg=bearing_deg,
+                spacing=spacing,
             )
 
-            # Extract text embeddings once per prompt batch (before camera loop)
-            with torch.inference_mode():
-                prompt_embeds, prompt_attention_mask, pooled_embed = (
-                    text_enc.extract_text_features(prompt_cur_with_uncond)
+            for scale_set in scale_sets:
+                scale_label = _fmt_scale(scale_set)
+                active_scales = (
+                    scale_set
+                    if scale_set is not None
+                    else getattr(self.var_wo_ddp, "adapter_active_scale_indices", None)
                 )
 
-            # Loop over camera trajectory views for multi-view validation
-            for view_idx, (lon, lat) in enumerate(camera_trajectory):
-                # Convert (lon, lat) to 3D direction vector
-                dir_np = lonlat_to_dir(np.array([lon]), np.array([lat]))  # (1, 3)
-                cam_dir = torch.from_numpy(dir_np).float().to(args.device)
-                cam_dir = cam_dir.expand(B_, 3)  # (B_, 3)
+                for sampling_cfg in sampling_cfgs:
+                    cfg_val = sampling_cfg.get("cfg", args.cfg)
+                    top_k_val = sampling_cfg.get("top_k", top_k)
+                    top_p_val = sampling_cfg.get("top_p", top_p)
+                    sampling_label = _fmt_sampling(sampling_cfg)
 
-                with torch.inference_mode():
-                    result = self.var_wo_ddp.autoregressive_infer_cfg(
-                        B=B_,
-                        label_B=label,
-                        encoder_hidden_states=prompt_embeds,
-                        encoder_attention_mask=prompt_attention_mask,
-                        encoder_pool_feat=pooled_embed,
-                        cfg=args.cfg,
-                        top_k=top_k,
-                        top_p=top_p,
-                        g_seed=seed,
-                        w_mask=w_mask,
-                        # Camera parameters for ray adaptation
-                        cam_dir=cam_dir,
-                        fov_deg=fov_deg,
-                        patch_size=patch_size,
-                        # Collect gate metrics during inference if enabled
-                        collect_metrics=args.adapter_metrics_every > 0,
+                    save_path = osp.join(
+                        base_save_dir,
+                        f"scale-{scale_label}",
+                        f"decode-{sampling_label}",
                     )
+                    os.makedirs(save_path, exist_ok=True)
 
-                    # Handle return value (tuple if metrics collected)
-                    if isinstance(result, tuple):
-                        recon_B3HW, gate_metrics = result
-
-                        # Log gate metrics to WandB per view
-                        if tb_lg is not None and gate_metrics is not None:
-                            # Compute global iteration for logging
-                            g_it = (
-                                cur_ep * 1000 + cur_iter
-                                if cur_iter >= 0
-                                else cur_ep * 1000
+                    for i in range(ceil(len(args.instance_prompt) / args.infer_bsz)):
+                        prompt_cur = args.instance_prompt[
+                            i * args.infer_bsz : min(
+                                (i + 1) * args.infer_bsz, len(args.instance_prompt)
                             )
-                            tb_lg.update(
-                                head=f"inference_gate_metrics/view{view_idx:02d}",
-                                gate_mean=gate_metrics["gate_mean"],
-                                gate_std=gate_metrics["gate_std"],
-                                step=g_it,
-                            )
-                            # Also log aggregated stats across all views (accumulated)
-                            if view_idx == 0:
-                                self._accumulated_gate_mean = []
-                                self._accumulated_gate_std = []
-                            self._accumulated_gate_mean.append(
-                                gate_metrics["gate_mean"]
-                            )
-                            self._accumulated_gate_std.append(gate_metrics["gate_std"])
+                        ]
+                        B_ = len(prompt_cur)
+                        prompt_cur_with_uncond = prompt_cur + [""] * B_
 
-                            # Log summary after all views
-                            if view_idx == len(camera_trajectory) - 1:
-                                tb_lg.update(
-                                    head="inference_gate_metrics/summary",
-                                    gate_mean_across_views=sum(
-                                        self._accumulated_gate_mean
-                                    )
-                                    / len(self._accumulated_gate_mean),
-                                    gate_std_across_views=sum(
-                                        self._accumulated_gate_std
-                                    )
-                                    / len(self._accumulated_gate_std),
-                                    step=g_it,
-                                )
-                    else:
-                        recon_B3HW = result
-
-                # Save images with view index suffix
-                if osp.exists(save_path):
-                    for j, label_text in enumerate(prompt_cur):
-                        chw = (
-                            (recon_B3HW[j].permute(1, 2, 0).cpu() * 255.0)
-                            .numpy()
-                            .astype(np.uint8)
-                        )  # (hwc)
-                        filename = "%s_view%02d.png" % (
-                            format_sentence(label_text),
-                            view_idx,
+                        # ── Fix 4: Use a null (zeros) label tensor so the fixed
+                        #    default_label class embedding does not bias text-conditioned
+                        #    generation.  The model is operating in text+camera mode;
+                        #    class-label conditioning is irrelevant here. ─────────────
+                        label = torch.zeros(B_, dtype=torch.long).to(
+                            args.device, non_blocking=True
                         )
-                        PImage.fromarray(chw).save(osp.join(save_path, filename))
 
-        self.var_wo_ddp.train()
+                        # Extract text embeddings once per prompt batch (before camera loop)
+                        with torch.inference_mode():
+                            prompt_embeds, prompt_attention_mask, pooled_embed = (
+                                text_enc.extract_text_features(prompt_cur_with_uncond)
+                            )
+
+                        # Loop over camera trajectory views for multi-view validation
+                        for view_idx, (lon, lat) in enumerate(camera_trajectory):
+                            # Convert (lon, lat) to 3D direction vector
+                            dir_np = lonlat_to_dir(
+                                np.array([lon]), np.array([lat])
+                            )  # (1, 3)
+                            cam_dir = torch.from_numpy(dir_np).float().to(args.device)
+                            cam_dir = cam_dir.expand(B_, 3)  # (B_, 3)
+
+                            with torch.inference_mode():
+                                result = self.var_wo_ddp.autoregressive_infer_cfg(
+                                    B=B_,
+                                    label_B=label,
+                                    encoder_hidden_states=prompt_embeds,
+                                    encoder_attention_mask=prompt_attention_mask,
+                                    encoder_pool_feat=pooled_embed,
+                                    cfg=cfg_val,
+                                    top_k=top_k_val,
+                                    top_p=top_p_val,
+                                    g_seed=seed,
+                                    w_mask=w_mask,
+                                    view_idx=view_idx,
+                                    # Camera parameters for ray adaptation
+                                    cam_dir=cam_dir,
+                                    fov_deg=fov_deg,
+                                    patch_size=patch_size,
+                                    # Collect gate metrics during inference if enabled
+                                    collect_metrics=args.adapter_metrics_every > 0,
+                                    adapter_active_scale_indices_override=active_scales,
+                                )
+
+                                # Handle return value (tuple if metrics collected)
+                                if isinstance(result, tuple):
+                                    recon_B3HW, inf_metrics = result
+
+                                    # ── Fix 3: Use real g_it for WandB step. ─────────
+                                    if tb_lg is not None and inf_metrics is not None:
+                                        tb_lg.update(
+                                            head=(
+                                                f"inference_ray_metrics/scale-{scale_label}/"
+                                                f"decode-{sampling_label}/view{view_idx:02d}"
+                                            ),
+                                            **inf_metrics,
+                                            step=g_it,
+                                        )
+                                else:
+                                    recon_B3HW = result
+
+                            # Save images with view index suffix
+                            if osp.exists(save_path):
+                                for j, label_text in enumerate(prompt_cur):
+                                    chw = (
+                                        (recon_B3HW[j].permute(1, 2, 0).cpu() * 255.0)
+                                        .numpy()
+                                        .astype(np.uint8)
+                                    )  # (hwc)
+                                    filename = "%s_view%02d.png" % (
+                                        format_sentence(label_text),
+                                        view_idx,
+                                    )
+                                    PImage.fromarray(chw).save(
+                                        osp.join(save_path, filename)
+                                    )
+
+        finally:
+            # ── Fix 5: Restore each module's original train/eval state. ──────
+            self.var_wo_ddp.train(var_was_training)
+            self.vae_local.train(vae_was_training)
+            text_enc.train(text_enc_was_training)
+
+            # ── Fix 1: Restore global RNG states unconditionally. ─────────────
+            torch.set_rng_state(rng_cpu_state)
+            if rng_cuda_state is not None:
+                torch.cuda.set_rng_state(rng_cuda_state)
+            random.setstate(rng_py_state)
+            np.random.set_state(rng_np_state)
 
     @torch.no_grad()
     def eval_ep(self, args, ld_val, text_enc):
@@ -370,6 +445,8 @@ class VARTrainer(object):
         cam_dir: Optional[Ten] = None,
         fov_deg: float = 100.0,
         args=None,
+        view_idx: Optional[torch.Tensor] = None,
+        loss_divisor: float = 1.0,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         # label_B是imagenet的class，inp_B3HW是输入图像
         # progressive training
@@ -418,7 +495,23 @@ class VARTrainer(object):
                 cam_dir=cam_dir,
                 fov_deg=fov_deg,
                 collect_metrics=collect_metrics,
+                disable_memory_kv=getattr(args, "disable_memory_kv", False)
+                if args is not None
+                else False,
+                theta_log_every=getattr(args, "theta_log_every", 0)
+                if args is not None
+                else 0,
+                g_it=g_it,
             )
+
+            # accumulate view histogram if provided
+            if self.view_hist is not None and view_idx is not None:
+                v = view_idx
+                if not torch.is_tensor(v):
+                    v = torch.tensor(v, device=logits_BLV.device)
+                v = v.to(logits_BLV.device).view(-1).long()
+                binc = torch.bincount(v, minlength=self.view_hist.numel())
+                self.view_hist.add_(binc)
             if not drop_idxs == None:
                 gt_BL = gt_BL[:, drop_idxs]
                 last_l = self.var.module.drop_start
@@ -441,12 +534,16 @@ class VARTrainer(object):
                     lw = self.loss_weight
             loss = loss.mul(lw).sum(dim=-1).mean()
 
+        if loss_divisor != 1.0:
+            loss = loss / float(loss_divisor)
+
         # backward
         grad_norm, scale_log2 = self.var_opt.backward_clip_step(
             loss=loss, stepping=stepping
         )
 
         # log
+        Lmean = Ltail = acc_mean = acc_tail = None
         pred_BL = logits_BLV.data.argmax(dim=-1)
         if it == 0 or it in metric_lg.log_iters:
             Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)).item()
@@ -476,47 +573,28 @@ class VARTrainer(object):
             )
             # accm是平均所有尺度的loss，acc_tail是最后一个level的loss
 
-        # log to tensorboard
-        _log_interval = self.adapter_metrics_every
-        if g_it == 0 or (_log_interval > 0 and g_it % _log_interval == 0):
-            prob_per_class_is_chosen = pred_BL.view(-1).bincount(minlength=V).float()
-            dist.allreduce(prob_per_class_is_chosen)
-            prob_per_class_is_chosen /= prob_per_class_is_chosen.sum()
-            cluster_usage = (
-                prob_per_class_is_chosen > 0.001 / V
-            ).float().mean().item() * 100
-            if dist.is_master():
-                if g_it == 0:
-                    tb_lg.update(
-                        head="AR_iter_loss", z_voc_usage=cluster_usage, step=-10000
-                    )
-                    tb_lg.update(
-                        head="AR_iter_loss", z_voc_usage=cluster_usage, step=-1000
-                    )
-                kw = dict(z_voc_usage=cluster_usage)
-                for si, (bg, ed) in enumerate(self.begin_ends):
-                    if 0 <= prog_si < si:
-                        break
-                    pred, tar = (
-                        logits_BLV.data[:, bg:ed].reshape(-1, V),
-                        gt_BL[:, bg:ed].reshape(-1),
-                    )
-                    acc = (pred.argmax(dim=-1) == tar).float().mean().item() * 100
-                    ce = self.val_loss(pred, tar).item()
-                    kw[f"acc_{self.resos[si]}"] = acc
-                    kw[f"L_{self.resos[si]}"] = ce
-                tb_lg.update(head="AR_iter_loss", **kw, step=g_it)
-                tb_lg.update(
-                    head="AR_iter_schedule",
-                    prog_a_reso=self.resos[prog_si],
-                    prog_si=prog_si,
-                    prog_wp=prog_wp,
-                    step=g_it,
-                )
+        # Minimal logging: core training metrics only
+        if dist.is_master() and Lmean is not None:
+            opt_obj = getattr(self.var_opt, "opt", None)
+            lr_vals = (
+                [pg.get("lr", 0.0) for pg in opt_obj.param_groups] if opt_obj else []
+            )
+            max_tlr = max(lr_vals) if lr_vals else 0.0
+            tb_lg.update(
+                head="AR_iter_loss",
+                Lm=Lmean,
+                Lt=Ltail,
+                Accm=acc_mean,
+                Acct=acc_tail,
+                step=g_it,
+            )
+            tb_lg.update(head="AR_iter_lr", lr_max=max_tlr, step=g_it)
+            if self.tclip > 0:
+                tb_lg.update(head="AR_iter_grad", grad_norm=grad_norm, step=g_it)
 
-                # Log ray adapter metrics if collected
-                if ray_metrics is not None:
-                    tb_lg.update(head="ray_adapter_metrics", **ray_metrics, step=g_it)
+        # Log ray adapter metrics (high-level) when present
+        if ray_metrics is not None and dist.is_master():
+            tb_lg.update(head="ray_adapter_metrics", **ray_metrics, step=g_it)
 
         self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = -1
         return grad_norm, scale_log2

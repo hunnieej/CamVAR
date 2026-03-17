@@ -60,7 +60,9 @@ class WandbLogger:
 
     def set_step(self, step: int):
         """Set the current global step for logging."""
-        self._step = step
+        # Ensure monotonic non-decreasing step to avoid WandB warnings.
+        if step is not None:
+            self._step = max(self._step, step)
 
     def update(self, head: str = "", **kwargs):
         """Log metrics to WandB.

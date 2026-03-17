@@ -683,6 +683,12 @@ class ModifiedAttnBlock(AttnBlock):
         ray_adapter_dim=128,
         ray_adapter_num_heads=4,
         ray_adapter_head_dim=32,
+        theta_gain_value=12.0,
+        temp_gain_value=12.0,
+        warm_start_steps=0,
+        warm_theta_gain_value=12.0,
+        warm_temp_gain_value=12.0,
+        warm_unfreeze=True,
         gate_floor=0.0,  # kept for backward compat but unused with Option B gate
         gate_max=0.1,
         gate_init=0.03,
@@ -721,6 +727,12 @@ class ModifiedAttnBlock(AttnBlock):
                 adapter_dim=ray_adapter_dim,
                 num_heads=ray_adapter_num_heads,
                 head_dim=ray_adapter_head_dim,
+                theta_gain_value=theta_gain_value,
+                temp_gain_value=temp_gain_value,
+                warm_start_steps=warm_start_steps,
+                warm_theta_gain_value=warm_theta_gain_value,
+                warm_temp_gain_value=warm_temp_gain_value,
+                warm_unfreeze=warm_unfreeze,
             )
             self.gate = PerBlockGate(
                 camera_dim=64,
@@ -748,6 +760,10 @@ class ModifiedAttnBlock(AttnBlock):
         theta=None,
         camera_embedder=None,
         scale_mask=None,  # (1, L, 1) tensor with 0/1 for inactive/active scale tokens
+        view_idx=None,
+        g_it=None,
+        # Ablation flag
+        disable_memory_kv=False,
         # Metrics collection flag
         collect_metrics=False,
     ):
@@ -810,7 +826,20 @@ class ModifiedAttnBlock(AttnBlock):
             gate_val = self.gate(
                 c_t
             )  # (B, 1, 1) — already bounded by gate_max via sigmoid
-            dx_ray = self.ray_adapter(u, memory, theta)  # (B, L, 1920)
+            dx_ray_out = self.ray_adapter(
+                u,
+                memory,
+                theta,
+                disable_memory_kv=disable_memory_kv,
+                attn_debug=collect_metrics,
+                scale_mask=scale_mask,
+                g_it=g_it,
+            )
+            if collect_metrics and isinstance(dx_ray_out, tuple):
+                dx_ray, attn_metrics = dx_ray_out
+            else:
+                dx_ray = dx_ray_out
+                attn_metrics = None
             gate_eff = (
                 gate_val  # no gate_floor needed; sigmoid ensures non-trivial gate
             )
@@ -818,26 +847,96 @@ class ModifiedAttnBlock(AttnBlock):
             # Collect metrics if requested
             if collect_metrics:
                 with torch.no_grad():
-                    # Gate metrics
-                    metrics["gate_abs_mean"] = gate_eff.abs().mean().item()
-                    metrics["gate_mean"] = gate_eff.mean().item()
-                    metrics["gate_std"] = gate_eff.std().item()
-                    metrics["gate_min"] = gate_eff.min().item()
-                    metrics["gate_max_val"] = gate_eff.max().item()
-
-                    # Activation norms
+                    # Activation norms (kept internal for inj ratio only)
                     dx_self_base_norm = dx_self_base.norm(dim=-1).mean().item()
-                    metrics["dx_self_base_norm"] = dx_self_base_norm
 
-                    metrics["dx_ray_norm"] = dx_ray.norm(dim=-1).mean().item()
+                    # SA_cam attention metrics from RayAdapter (if provided)
+                    if attn_metrics is not None:
+                        metrics.update(attn_metrics)
 
-                    # Weight norms (Frobenius norm of weight matrices)
-                    metrics["p_down_weight_norm"] = (
-                        self.ray_adapter.p_down.weight.norm().item()
-                    )
-                    metrics["p_up_weight_norm"] = (
-                        self.ray_adapter.p_up.weight.norm().item()
-                    )
+                    # View-sensitivity diagnostics for dx_ray (conditional half only in CFG)
+                    if view_idx is not None:
+                        dx_ray_cond = (
+                            dx_ray[: (dx_ray.shape[0] // 2)]
+                            if dx_ray.shape[0] % 2 == 0
+                            else dx_ray
+                        )
+
+                        # Apply active-token masking if provided
+                        if scale_mask is not None:
+                            active_mask = scale_mask.squeeze(-1).squeeze(0).bool()
+                            if active_mask.shape[0] != dx_ray_cond.shape[1]:
+                                dx_ray_cond_active = dx_ray_cond
+                                active_mask = None
+                            else:
+                                dx_ray_cond_active = dx_ray_cond[:, active_mask, :]
+                        else:
+                            active_mask = None
+                            dx_ray_cond_active = dx_ray_cond
+
+                        active_tokens = (
+                            int(active_mask.sum().item())
+                            if active_mask is not None
+                            else dx_ray_cond.shape[1]
+                        )
+
+                        # Cache per-view (reset caches when starting a trajectory)
+                        if view_idx == 0:
+                            for attr in (
+                                "_dx_ray_view0_cache",
+                                "_dx_ray_view6_cache",
+                                "_dx_ray_view0_all_cache",
+                                "_dx_ray_view6_all_cache",
+                            ):
+                                if hasattr(self, attr):
+                                    delattr(self, attr)
+                            self._dx_ray_view0_cache = (
+                                dx_ray_cond_active.detach().float().clone()
+                            )
+                            self._dx_ray_view0_all_cache = (
+                                dx_ray_cond.detach().float().clone()
+                            )
+                        elif view_idx == 6:
+                            self._dx_ray_view6_cache = (
+                                dx_ray_cond_active.detach().float().clone()
+                            )
+                            self._dx_ray_view6_all_cache = (
+                                dx_ray_cond.detach().float().clone()
+                            )
+
+                        dx_view_l2_active = None
+
+                        has_v0_act = hasattr(self, "_dx_ray_view0_cache")
+                        has_v6_act = hasattr(self, "_dx_ray_view6_cache")
+
+                        # Active caches
+                        if has_v0_act and has_v6_act:
+                            v0 = getattr(self, "_dx_ray_view0_cache", None)
+                            v6 = getattr(self, "_dx_ray_view6_cache", None)
+                            if (
+                                v0 is not None
+                                and v6 is not None
+                                and v0.shape == v6.shape
+                                and torch.isfinite(v0).all()
+                                and torch.isfinite(v6).all()
+                            ):
+                                dx_view_l2_active = (v0 - v6).norm(dim=-1).mean().item()
+                                metrics["dx_ray_view_l2_active"] = dx_view_l2_active
+                        if attn_metrics is not None:
+                            metrics.update(attn_metrics)
+
+                        # Std over tokens (active tokens only)
+                        std_active_val = None
+                        if (
+                            active_tokens >= 2
+                            and torch.isfinite(dx_ray_cond_active).all()
+                        ):
+                            std_active_val = (
+                                dx_ray_cond_active.std(dim=1, unbiased=False)
+                                .mean()
+                                .item()
+                            )
+                            metrics["dx_ray_std_over_tokens_active"] = std_active_val
 
             # 4. CRITICAL: Add ray residual at self-attention junction
             # Apply scale_mask to zero out adapter contribution for inactive scales
@@ -852,11 +951,27 @@ class ModifiedAttnBlock(AttnBlock):
             if collect_metrics:
                 with torch.no_grad():
                     eps = 1e-8
-                    dx_ray_masked_norm = dx_ray_masked.norm(dim=-1).mean().item()
-                    metrics["dx_ray_masked_norm"] = dx_ray_masked_norm
-                    metrics["inj_ratio"] = dx_ray_masked_norm / (
-                        metrics["dx_self_base_norm"] + eps
-                    )
+                    if scale_mask is not None:
+                        active_mask = scale_mask.squeeze(-1).squeeze(0).bool()
+                        if active_mask.any():
+                            gate_dx_ray_active = (gate_eff * dx_ray)[:, active_mask, :]
+                            dx_self_active = dx_self_base[:, active_mask, :]
+                            active_ray_norm = (
+                                gate_dx_ray_active.norm(dim=-1).mean().item()
+                            )
+                            active_self_norm = dx_self_active.norm(dim=-1).mean().item()
+                            metrics["dx_ray_masked_norm_active"] = active_ray_norm
+                            metrics["inj_ratio_active"] = active_ray_norm / (
+                                active_self_norm + eps
+                            )
+                    else:
+                        # No masking means all tokens active
+                        ray_norm_all = (gate_eff * dx_ray).norm(dim=-1).mean().item()
+                        self_norm_all = dx_self_base.norm(dim=-1).mean().item()
+                        metrics["dx_ray_masked_norm_active"] = ray_norm_all
+                        metrics["inj_ratio_active"] = ray_norm_all / (
+                            self_norm_all + eps
+                        )
 
             x = x + self.drop_path(dx_self_base.mul_(gamma1)) + dx_ray_masked
         else:

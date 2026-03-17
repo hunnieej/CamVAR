@@ -25,6 +25,51 @@ class Args:
         if not hasattr(self, "adapter_metrics_every"):
             self.adapter_metrics_every = 0
 
+        # Ablation: disable memory K/V in CameraAwareAttention (tokens-only K/V)
+        if not hasattr(self, "disable_memory_kv"):
+            self.disable_memory_kv = False
+
+        # Theta stats logging interval (iterations); 0 = off
+        if not hasattr(self, "theta_log_every"):
+            self.theta_log_every = 0
+
+        # Inference sweeps (Stage 3 & 4): optional lists, default None
+        if not hasattr(self, "inference_scale_sets"):
+            self.inference_scale_sets = None
+        if not hasattr(self, "inference_sampling_setups"):
+            self.inference_sampling_setups = None
+
+        # Ray adapter gains (fixed/buffer values for SA_cam contrast)
+        if not hasattr(self, "theta_gain_value"):
+            self.theta_gain_value = 12.0
+        if not hasattr(self, "temp_gain_value"):
+            self.temp_gain_value = 12.0
+
+        # SA_cam warm start controls
+        if not hasattr(self, "warm_start_steps"):
+            self.warm_start_steps = 0
+        if not hasattr(self, "warm_theta_gain_value"):
+            self.warm_theta_gain_value = 12.0
+        if not hasattr(self, "warm_temp_gain_value"):
+            self.warm_temp_gain_value = 12.0
+        if not hasattr(self, "warm_unfreeze"):
+            self.warm_unfreeze = True
+
+        # ERP grouped batching controls
+        if not hasattr(self, "erp_scenes_per_batch"):
+            self.erp_scenes_per_batch = 1
+        if not hasattr(self, "erp_views_per_scene"):
+            self.erp_views_per_scene = 12
+        if not hasattr(self, "erp_same_scene_accum"):
+            self.erp_same_scene_accum = False
+        if not hasattr(self, "erp_view_groups"):
+            self.erp_view_groups = [[0, 3, 6, 9], [1, 4, 7, 10], [2, 5, 8, 11]]
+        # Dynamic grouping replaces the static erp_view_groups list
+        if not hasattr(self, "erp_group_size"):
+            self.erp_group_size = 4
+        if not hasattr(self, "erp_grouping_mode"):
+            self.erp_grouping_mode = "spread"
+
         # 额外的依赖项
         self.vae_ckpt = os.path.join(self.ckpt_path, "vae_ch160v4096z32.pth")
         self.var_ckpt = os.path.join(self.ckpt_path, f"var_d{self.depth}.pth")

@@ -80,6 +80,12 @@ class ModifiedVAR(nn.Module):
         ray_adapter_num_heads=4,
         ray_adapter_head_dim=32,
         adapter_active_scale_indices=None,  # List of scale indices [0-9] where adapter is active
+        theta_gain_value=12.0,
+        temp_gain_value=12.0,
+        warm_start_steps: int = 0,
+        warm_theta_gain_value: float = 12.0,
+        warm_temp_gain_value: float = 12.0,
+        warm_unfreeze: bool = True,
         gate_floor=0.0,
         gate_max=0.1,
         gate_init=0.03,
@@ -297,6 +303,12 @@ class ModifiedVAR(nn.Module):
                         ray_adapter_dim=adapter_dim,
                         ray_adapter_num_heads=ray_adapter_num_heads,
                         ray_adapter_head_dim=ray_adapter_head_dim,
+                        theta_gain_value=theta_gain_value,
+                        temp_gain_value=temp_gain_value,
+                        warm_start_steps=warm_start_steps,
+                        warm_theta_gain_value=warm_theta_gain_value,
+                        warm_temp_gain_value=warm_temp_gain_value,
+                        warm_unfreeze=warm_unfreeze,
                         gate_floor=0.0,
                         gate_max=gate_max,
                         gate_init=gate_init,
@@ -503,8 +515,15 @@ class ModifiedVAR(nn.Module):
         cam_dir: Optional[torch.Tensor] = None,
         fov_deg: float = 100.0,
         patch_size: int = 16,
+        # View index for multi-view logging (optional)
+        view_idx: Optional[int] = None,
+        # Ablation flags
+        disable_memory_kv: bool = False,
         # Metrics collection flag
         collect_metrics: bool = False,
+        # Optional override for adapter active scales during inference
+        adapter_active_scale_indices_override: Optional[list] = None,
+        g_it=None,
     ) -> Union[torch.Tensor, tuple]:
         """Autoregressive inference with optional ray adaptation.
 
@@ -523,6 +542,7 @@ class ModifiedVAR(nn.Module):
             rng = self.rng
 
         # Prepare camera inputs if ray adaptation is enabled
+        theta_metrics = None
         if self.enable_ray_adaptation and cam_dir is not None:
             # For CFG inference, we need to duplicate cam_dir for both conditional and unconditional
             # cam_dir is (B, 3), we need (2*B, 3) for CFG
@@ -539,6 +559,23 @@ class ModifiedVAR(nn.Module):
             )  # (2*B, L, 3)
             # Note: cam_dir_cfg is kept as raw (2*B, 3) - blocks will embed it themselves
             theta = self.cam_rope(r_world)  # (2*B, L, 16)
+
+            # Ablation (2): Theta statistics — verify view sensitivity (inference)
+            import dist as _dist_infer
+
+            # Print summary stats every call (rank 0) and compute view0 vs view6 only when both cached
+            if _dist_infer.is_master():
+                with torch.no_grad():
+                    theta_abs_mean = theta.abs().mean().item()
+                    theta_std_over_tokens = theta.std(dim=1).mean().item()
+
+                    msg = (
+                        f"[theta infer view={view_idx}] "
+                        f"abs_mean={theta_abs_mean:.4f}  "
+                        f"std_over_tokens={theta_std_over_tokens:.4f}"
+                    )
+
+                    # print(msg)
 
             # Reset memory (Phase 1: zeros) - needs 2*B for CFG
             memory = self.memory_updater.reset_memory(
@@ -595,10 +632,16 @@ class ModifiedVAR(nn.Module):
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
         # Initialize metrics collection
-        all_gate_values = [] if collect_metrics else None
+        block_metrics_list = [] if collect_metrics else None
 
         for b in self.blocks:
             b.attn.kv_caching(True)
+        active_scales = (
+            adapter_active_scale_indices_override
+            if adapter_active_scale_indices_override is not None
+            else self.adapter_active_scale_indices
+        )
+
         for si, pn in enumerate(self.patch_nums):
             ratio = si / self.num_stages_minus_1
             t = cfg * ratio
@@ -620,7 +663,7 @@ class ModifiedVAR(nn.Module):
 
             # Compute scale_mask for current scale: (1, pn*pn, 1) with 1.0 if si is active, 0.0 otherwise
             if self.enable_ray_adaptation:
-                scale_active = si in self.adapter_active_scale_indices
+                scale_active = si in active_scales
                 scale_mask_cur = (
                     torch.ones(1, pn * pn, 1, device=sos.device, dtype=torch.float32)
                     if scale_active
@@ -649,6 +692,10 @@ class ModifiedVAR(nn.Module):
                         cam_dir=cam_dir_cfg,
                         camera_embedder=self.camera_embedder,
                         scale_mask=scale_mask_cur,  # Per-scale mask for inference
+                        view_idx=view_idx,
+                        g_it=g_it,
+                        # Ablation flag
+                        disable_memory_kv=disable_memory_kv,
                         # Metrics collection
                         collect_metrics=collect_metrics,
                     )
@@ -656,12 +703,8 @@ class ModifiedVAR(nn.Module):
                     # Handle return value (tuple if metrics collected, else just x)
                     if collect_metrics:
                         x, block_metrics = result
-                        # Only store gate values (Option 3: lightweight)
-                        if (
-                            block_metrics is not None
-                            and "gate_abs_mean" in block_metrics
-                        ):
-                            all_gate_values.append(block_metrics["gate_abs_mean"])
+                        if block_metrics_list is not None:
+                            block_metrics_list.append(block_metrics)
                     else:
                         x = result
                 else:
@@ -673,6 +716,7 @@ class ModifiedVAR(nn.Module):
                         attn_bias=None,
                         freqs_cis=freqs_cis_cur,
                         layer_id=i,
+                        g_it=g_it,
                     )
 
             # For ray adaptation, update memory after all blocks (but not implemented in inference yet)
@@ -737,13 +781,42 @@ class ModifiedVAR(nn.Module):
             )
 
         # Aggregate metrics if collected
-        if collect_metrics and all_gate_values:
-            # all_gate_values contains Python floats, convert to numpy for aggregation
-            gate_array = np.array(all_gate_values)  # (num_blocks,)
-            aggregated_metrics = {
-                "gate_mean": float(gate_array.mean()),
-                "gate_std": float(gate_array.std()),
-            }
+        aggregated_metrics = None
+        if collect_metrics:
+            aggregated_metrics = {}
+            if block_metrics_list:
+                metric_keys = block_metrics_list[0].keys()
+
+                # Debug: show sample block keys and final keys (limited times)
+                import dist as _dist_dbg_var
+
+                if not hasattr(self, "_dbg_var_infer_calls"):
+                    self._dbg_var_infer_calls = 0
+                if self._dbg_var_infer_calls < 3 and _dist_dbg_var.is_master():
+                    # print(
+                    #     f"[var infer dbg] sample block metric keys: {list(metric_keys)}"
+                    # )
+                    pass
+
+                for key in metric_keys:
+                    values = [m[key] for m in block_metrics_list if key in m]
+                    if not values:
+                        continue
+                    aggregated_metrics[f"{key}_mean"] = sum(values) / len(values)
+                    if "gate" in key:
+                        mean_val = aggregated_metrics[f"{key}_mean"]
+                        variance = sum((v - mean_val) ** 2 for v in values) / len(
+                            values
+                        )
+                        aggregated_metrics[f"{key}_std_across_blocks"] = variance**0.5
+
+                if self._dbg_var_infer_calls < 3 and _dist_dbg_var.is_master():
+                    # print(
+                    #     f"[var infer dbg] aggregated_metric_keys: {list(aggregated_metrics.keys())}"
+                    # )
+                    pass
+                self._dbg_var_infer_calls += 1
+
             return generated_img, aggregated_metrics
         else:
             return generated_img
@@ -839,6 +912,11 @@ class ModifiedVAR(nn.Module):
         cam_dir: Optional[torch.Tensor] = None,
         fov_deg: float = 100.0,
         patch_size: int = 16,
+        # Ablation flags
+        disable_memory_kv: bool = False,
+        # Theta stats logging (0 = off, >0 logs every N global iters via g_it param)
+        theta_log_every: int = 0,
+        g_it: int = 0,
         # Metrics collection
         collect_metrics: bool = False,
     ) -> torch.Tensor:
@@ -861,6 +939,7 @@ class ModifiedVAR(nn.Module):
         B = x_BLCv_wo_first_l.shape[0]
 
         # Prepare camera inputs if ray adaptation is enabled
+        theta_metrics = None
         if self.enable_ray_adaptation and cam_dir is not None:
             # Construct rays and compute theta
             r_world = RayConstructor.compute_rays(
@@ -872,6 +951,29 @@ class ModifiedVAR(nn.Module):
                 patch_size,
             )  # (B, L, 3)
             theta = self.cam_rope(r_world)  # (B, L, 16)
+
+            # Ablation (2): Theta statistics — verify view sensitivity
+            if theta_log_every > 0 and (g_it == 0 or g_it % theta_log_every == 0):
+                import dist as _dist
+
+                if _dist.is_master():
+                    with torch.no_grad():
+                        theta_abs_mean = theta.abs().mean().item()
+                        # std over token dimension, then average over batch and rotary pairs
+                        theta_std_over_tokens = theta.std(dim=1).mean().item()
+
+                        # Print for console visibility
+                        # print(
+                        #     f"[theta g_it={g_it}] "
+                        #     f"abs_mean={theta_abs_mean:.4f}  "
+                        #     f"std_over_tokens={theta_std_over_tokens:.4f}  "
+                        # )
+
+                        # Stash for WandB logging (returned in aggregated_metrics)
+                        theta_metrics = {
+                            "theta_abs_mean": theta_abs_mean,
+                            "theta_std_over_tokens": theta_std_over_tokens,
+                        }
 
             # Reset memory (Phase 1: zeros each forward pass)
             memory = self.memory_updater.reset_memory(
@@ -943,11 +1045,11 @@ class ModifiedVAR(nn.Module):
         else:
             drop_idxs = None
 
-        # Transformer blocks with ray adaptation
-        # Collect metrics per block if requested
-        block_metrics_list = (
-            [] if (collect_metrics and self.enable_ray_adaptation) else None
-        )
+            # Transformer blocks with ray adaptation
+            # Collect metrics per block if requested
+            block_metrics_list = (
+                [] if (collect_metrics and self.enable_ray_adaptation) else None
+            )
 
         for i, b in enumerate(self.blocks):
             if self.enable_ray_adaptation:
@@ -965,7 +1067,9 @@ class ModifiedVAR(nn.Module):
                     cam_dir=cam_dir,
                     camera_embedder=self.camera_embedder,
                     scale_mask=self.adapter_scale_mask,  # (1, L, 1) mask for active scales
+                    disable_memory_kv=disable_memory_kv,
                     collect_metrics=collect_metrics,
+                    g_it=g_it,
                 )
 
                 # Handle return value (may be tuple if metrics collected)
@@ -995,9 +1099,11 @@ class ModifiedVAR(nn.Module):
         logits_BLV = self.get_logits(x_BLC.float())
 
         # Aggregate metrics if collected
-        aggregated_metrics = None
+        aggregated_metrics = theta_metrics.copy() if theta_metrics is not None else None
         if collect_metrics and block_metrics_list:
-            aggregated_metrics = {}
+            if aggregated_metrics is None:
+                aggregated_metrics = {}
+
             metric_keys = block_metrics_list[0].keys()
 
             # Compute mean and std across blocks for each metric
@@ -1010,6 +1116,18 @@ class ModifiedVAR(nn.Module):
                     mean_val = aggregated_metrics[f"{key}_mean"]
                     variance = sum((v - mean_val) ** 2 for v in values) / len(values)
                     aggregated_metrics[f"{key}_std_across_blocks"] = variance**0.5
+
+            # Debug: show metric keys (limited)
+            import dist as _dist_dbg_train
+
+            if not hasattr(self, "_dbg_var_train_calls"):
+                self._dbg_var_train_calls = 0
+            # if self._dbg_var_train_calls < 3 and _dist_dbg_train.is_master():
+            #     print(f"[var train dbg] sample block metric keys: {list(metric_keys)}")
+            #     print(
+            #         f"[var train dbg] aggregated_metric_keys: {list(aggregated_metrics.keys())}"
+            #     )
+            #     self._dbg_var_train_calls += 1
 
         return logits_BLV, x_BLC, drop_idxs, aggregated_metrics
 
